@@ -40,6 +40,11 @@ use librespot::playback::mixer::alsamixer::AlsaMixer;
 mod player_event_handler;
 use player_event_handler::{run_program_on_sink_events, EventHandler};
 
+
+mod server;
+
+use server::ApiServerHandler;
+
 fn device_id(name: &str) -> String {
     HEXLOWER.encode(&Sha1::digest(name.as_bytes()))
 }
@@ -1937,6 +1942,11 @@ async fn main() {
         }
     }
 
+    let api_server = ApiServerHandler::spawn().await.unwrap_or_else(|e| {
+        error!("could not initialize API : {}", e);
+        exit(1);
+    });
+
     loop {
         tokio::select! {
             credentials = async {
@@ -1990,6 +2000,8 @@ async fn main() {
                         exit(1);
                     }
                 };
+
+                api_server.set_spirc(spirc_.clone());
                 spirc = Some(spirc_);
                 spirc_task = Some(Box::pin(spirc_task_));
 
@@ -2025,6 +2037,7 @@ async fn main() {
                 exit(1);
             },
             _ = tokio::signal::ctrl_c() => {
+                println!("received Ctrl+C");
                 break;
             },
             else => break,
@@ -2034,6 +2047,8 @@ async fn main() {
     info!("Gracefully shutting down");
 
     let mut shutdown_tasks = tokio::task::JoinSet::new();
+
+    shutdown_tasks.spawn(api_server.quit_and_join());
 
     // Shutdown spirc if necessary
     if let Some(spirc) = spirc {
