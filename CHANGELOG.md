@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [core] Fix "no native root CA certificates found" on platforms unsupported
+  by `rustls-native-certs`.
+- [core] Fix all APs rejecting with "TryAnotherAP" when connecting session
+  on Android platform.
+- [core] Fix "Invalid Credentials" when using a Keymaster access token and
+  client ID on Android platform.
+
 ### Removed
 
 ## [0.6.0] - 2024-10-30
