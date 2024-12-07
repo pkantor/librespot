@@ -1,6 +1,7 @@
 use std::{net::UdpSocket, thread, time::Duration};
 
 use librespot_connect::spirc::Spirc;
+use librespot_core::spotify_id::SpotifyItemType;
 use librespot_playback::player::PlayerEventChannel;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
@@ -70,6 +71,7 @@ struct GetCurrentTrackRes {
     song_name: String,
     song_id: String,
     song_artists: Vec<String>,
+    song_uri: String,
 }
 
 impl ApiServerTask {
@@ -96,6 +98,7 @@ impl ApiServerTask {
                 song_name: String::new(),
                 song_id: String::new(),
                 song_artists: Vec::new(),
+                song_uri: String::new(),
             };
     
             loop {
@@ -105,7 +108,10 @@ impl ApiServerTask {
                             librespot_playback::player::PlayerEvent::TrackChanged { audio_item } => {
                                 println!("changing currently played song to {}", audio_item.name);
                                 current_played_song.song_name = audio_item.name;
-                                current_played_song.song_id = audio_item.track_id.id.to_string();
+                                current_played_song.song_uri = audio_item.uri;
+                                if audio_item.track_id.item_type == SpotifyItemType::Track {
+                                    current_played_song.song_id = audio_item.track_id.id.to_string();
+                                }
                                 match audio_item.unique_fields {
                                     librespot_metadata::audio::UniqueFields::Track { artists, album: _, album_artists: _, popularity: _, number: _, disc_number: _ } => {
                                         current_played_song.song_artists = artists.iter().map(|artist| artist.name.clone()).collect();
