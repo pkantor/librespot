@@ -1942,7 +1942,7 @@ async fn main() {
         }
     }
 
-    let api_server = ApiServerHandler::spawn().await.unwrap_or_else(|e| {
+    let api_server = ApiServerHandler::spawn(player.get_player_event_channel()).await.unwrap_or_else(|e| {
         error!("could not initialize API : {}", e);
         exit(1);
     });

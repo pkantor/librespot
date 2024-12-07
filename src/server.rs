@@ -1,6 +1,8 @@
 use std::{net::UdpSocket, thread, time::Duration};
 
 use librespot_connect::spirc::Spirc;
+use librespot_playback::player::PlayerEventChannel;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
 
 use log::debug;
@@ -22,14 +24,15 @@ pub struct ApiServerHandler {
 }
 
 impl ApiServerHandler {
-    pub async fn spawn() -> Result<ApiServerHandler, ApiServerError> {
+    pub async fn spawn(player_events: PlayerEventChannel) -> Result<ApiServerHandler, ApiServerError> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let task_running = false;
 
         let api_server_task = ApiServerTask {
             spirc: None,
             cmd_rx,
-            task_running
+            task_running,
+            player_events
         };
         println!("pre run");
         api_server_task.run();
@@ -49,7 +52,7 @@ impl ApiServerHandler {
         let _ = self.cmd_tx.send(ApiServerCommand::Quit);
         println!("waiting for task to stop");
         while self.task_running {
-
+            thread::sleep(Duration::from_millis(100));
         }
         println!("APIServer task stopped")
     }
@@ -59,6 +62,14 @@ struct ApiServerTask {
     spirc: Option<Spirc>,
     cmd_rx: mpsc::UnboundedReceiver<ApiServerCommand>,
     task_running: bool,
+    player_events: PlayerEventChannel
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct GetCurrentTrackRes {
+    song_name: String,
+    song_id: String,
+    song_artists: Vec<String>,
 }
 
 impl ApiServerTask {
@@ -81,8 +92,93 @@ impl ApiServerTask {
             }
     
             let mut buf = [0u8; 1024];
+            let mut current_played_song = GetCurrentTrackRes {
+                song_name: String::new(),
+                song_id: String::new(),
+                song_artists: Vec::new(),
+            };
     
             loop {
+                match self.player_events.try_recv() {
+                    Ok(data) => {
+                        match data {
+                            librespot_playback::player::PlayerEvent::TrackChanged { audio_item } => {
+                                println!("changing currently played song to {}", audio_item.name);
+                                current_played_song.song_name = audio_item.name;
+                                current_played_song.song_id = audio_item.track_id.id.to_string();
+                                match audio_item.unique_fields {
+                                    librespot_metadata::audio::UniqueFields::Track { artists, album: _, album_artists: _, popularity: _, number: _, disc_number: _ } => {
+                                        current_played_song.song_artists = artists.iter().map(|artist| artist.name.clone()).collect();
+                                    }
+                                    librespot_metadata::audio::UniqueFields::Episode { description: _, publish_time: _, show_name: _ } => {
+                                        current_played_song.song_artists = Vec::new();
+                                    }
+                                }
+                            },
+                            librespot_playback::player::PlayerEvent::PlayRequestIdChanged { play_request_id: _ } => {
+                                
+                            }
+                            librespot_playback::player::PlayerEvent::Stopped { play_request_id: _, track_id: _ } => {
+
+                            }
+                            librespot_playback::player::PlayerEvent::Loading { play_request_id: _, track_id: _, position_ms: _ } => {
+                            
+                            },
+                            librespot_playback::player::PlayerEvent::Preloading { track_id: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::Playing { play_request_id: _, track_id: _, position_ms: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::Paused { play_request_id: _, track_id: _, position_ms: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::TimeToPreloadNextTrack { play_request_id: _, track_id: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::EndOfTrack { play_request_id: _, track_id: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::Unavailable { play_request_id: _, track_id: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::VolumeChanged { volume: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::PositionCorrection { play_request_id: _, track_id: _, position_ms: _ } => {
+                                
+                            },
+                            librespot_playback::player::PlayerEvent::Seeked { play_request_id: _, track_id: _, position_ms: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::SessionConnected { connection_id: _, user_name: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::SessionDisconnected { connection_id: _, user_name: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::SessionClientChanged { client_id: _, client_name: _, client_brand_name: _, client_model_name: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::ShuffleChanged { shuffle: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::RepeatChanged { repeat: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::AutoPlayChanged { auto_play: _ } => {
+
+                            },
+                            librespot_playback::player::PlayerEvent::FilterExplicitContentChanged { filter: _ } => {
+
+                            },
+                        }
+                    }
+                    Err(_e) => {
+
+                    }
+                }
+
                 match self.cmd_rx.try_recv() {
                     Ok(data) => {
                         match data {
@@ -94,7 +190,7 @@ impl ApiServerTask {
                         }
                     }
     
-                    Err(e) => {
+                    Err(_e) => {
                     }
                 }
     
@@ -119,6 +215,22 @@ impl ApiServerTask {
                                 }
                             }
 
+                            "current_track" => {
+                                match serde_json::to_string(&current_played_song) {
+                                    Ok(json) => {
+                                        match socket.send_to(json.as_bytes(), data.1) {
+                                            Ok(_) => {},
+                                            Err(e) => {
+                                                println!("cannot send data to {}, {}", data.1.ip().to_string(), e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("cannot parse data to json, {}", e);
+                                    },
+                                }
+                            }
+
                             "resume" => {
                                 if let Some(spirc) = &self.spirc {
                                     println!("calling resume");
@@ -133,7 +245,7 @@ impl ApiServerTask {
                         }
                     
                     }
-                    Err(e) => {
+                    Err(_e) => {
                     }
                 }
             }
