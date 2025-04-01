@@ -1,6 +1,6 @@
 use std::{net::UdpSocket, thread, time::Duration};
 
-use librespot_connect::spirc::Spirc;
+use librespot_connect::Spirc;
 use librespot_core::spotify_id::SpotifyItemType;
 use librespot_playback::player::PlayerEventChannel;
 use serde::{Deserialize, Serialize};
@@ -169,7 +169,7 @@ impl ApiServerTask {
                             librespot_playback::player::PlayerEvent::ShuffleChanged { shuffle: _ } => {
 
                             },
-                            librespot_playback::player::PlayerEvent::RepeatChanged { repeat: _ } => {
+                            librespot_playback::player::PlayerEvent::RepeatChanged { context: _, track: _} => {
 
                             },
                             librespot_playback::player::PlayerEvent::AutoPlayChanged { auto_play: _ } => {
