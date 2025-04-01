@@ -65,6 +65,10 @@ struct ApiServerTask {
     task_running: bool,
     player_events: PlayerEventChannel
 }
+#[derive(Debug, Serialize, Deserialize)]
+struct SetVolumeFrame {
+    volume: u16,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct GetCurrentTrackRes {
@@ -203,10 +207,14 @@ impl ApiServerTask {
                 match socket.recv_from(&mut buf) {
                     Ok(data) => {
     
-                        let message = String::from_utf8_lossy(&buf[..data.0]);
-                        println!("Received '{}' from {}", message, data.1.ip().to_string());
+                        let recv_data = String::from_utf8_lossy(&buf[..data.0]);
+                        let mut raw_message = recv_data.splitn(2, ' ');
+                        let command = raw_message.next().unwrap_or("");
+
+                        println!("Received '{}' from {}", command, data.1.ip().to_string());
         
-                        match message.trim() {
+
+                        match command.trim() {
                             "next" => {
                                 if let Some(spirc) = &self.spirc {
                                     println!("calling next song {}", data.1.ip().to_string());
@@ -245,8 +253,37 @@ impl ApiServerTask {
                                 }
                             }
 
+                            "volup" => {
+                                if let Some(spirc) = &self.spirc {
+                                    println!("calling volume down");
+                                    let _ = spirc.volume_down();
+                                }
+                            }
+                            
+                            "voldown" => {
+                                if let Some(spirc) = &self.spirc {
+                                    println!("calling volume up");
+                                    let _ = spirc.volume_up();
+                                }
+                            }
+
+                            "setvol" => {
+                                if let Some(spirc) = &self.spirc {
+                                    let user_json = raw_message.next().unwrap_or("");
+                                    match serde_json::from_str::<SetVolumeFrame>(user_json) {
+                                        Ok(data) => 
+                                        {
+                                            let percentage = (data.volume as f64 / u16::MAX as f64) * 100.0;
+                                            println!("calling set volume ({:.2}%)", percentage);
+                                            let _ = spirc.set_volume(data.volume);
+                                        }
+                                        Err(_) => println!("SetVolume invalid JSON {}", user_json),
+                                    }
+                                }
+                            }
+
                             _ => {
-                                println!("Unknown command: {}", message.trim());
+                                println!("Unknown command: {}", command.trim());
                             }
                         }
                     
