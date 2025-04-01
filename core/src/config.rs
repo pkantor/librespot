@@ -1,5 +1,6 @@
 use std::{fmt, path::PathBuf, str::FromStr};
 
+use librespot_protocol::devices::DeviceType as ProtoDeviceType;
 use url::Url;
 
 pub(crate) const KEYMASTER_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
@@ -78,7 +79,6 @@ pub enum DeviceType {
     UnknownSpotify = 100,
     CarThing = 101,
     Observer = 102,
-    HomeThing = 103,
 }
 
 impl FromStr for DeviceType {
@@ -101,7 +101,6 @@ impl FromStr for DeviceType {
             "smartwatch" => Ok(Smartwatch),
             "chromebook" => Ok(Chromebook),
             "carthing" => Ok(CarThing),
-            "homething" => Ok(HomeThing),
             _ => Err(()),
         }
     }
@@ -129,7 +128,6 @@ impl From<&DeviceType> for &str {
             UnknownSpotify => "UnknownSpotify",
             CarThing => "CarThing",
             Observer => "Observer",
-            HomeThing => "HomeThing",
         }
     }
 }
@@ -144,5 +142,30 @@ impl fmt::Display for DeviceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str: &str = self.into();
         f.write_str(str)
+    }
+}
+
+impl From<DeviceType> for ProtoDeviceType {
+    fn from(value: DeviceType) -> Self {
+        match value {
+            DeviceType::Unknown => ProtoDeviceType::UNKNOWN,
+            DeviceType::Computer => ProtoDeviceType::COMPUTER,
+            DeviceType::Tablet => ProtoDeviceType::TABLET,
+            DeviceType::Smartphone => ProtoDeviceType::SMARTPHONE,
+            DeviceType::Speaker => ProtoDeviceType::SPEAKER,
+            DeviceType::Tv => ProtoDeviceType::TV,
+            DeviceType::Avr => ProtoDeviceType::AVR,
+            DeviceType::Stb => ProtoDeviceType::STB,
+            DeviceType::AudioDongle => ProtoDeviceType::AUDIO_DONGLE,
+            DeviceType::GameConsole => ProtoDeviceType::GAME_CONSOLE,
+            DeviceType::CastAudio => ProtoDeviceType::CAST_VIDEO,
+            DeviceType::CastVideo => ProtoDeviceType::CAST_AUDIO,
+            DeviceType::Automobile => ProtoDeviceType::AUTOMOBILE,
+            DeviceType::Smartwatch => ProtoDeviceType::SMARTWATCH,
+            DeviceType::Chromebook => ProtoDeviceType::CHROMEBOOK,
+            DeviceType::UnknownSpotify => ProtoDeviceType::UNKNOWN_SPOTIFY,
+            DeviceType::CarThing => ProtoDeviceType::CAR_THING,
+            DeviceType::Observer => ProtoDeviceType::OBSERVER,
+        }
     }
 }

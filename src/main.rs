@@ -1,7 +1,3 @@
-use data_encoding::HEXLOWER;
-use futures_util::StreamExt;
-use log::{debug, error, info, trace, warn};
-use sha1::{Digest, Sha1};
 use std::{
     env,
     fs::create_dir_all,
@@ -12,12 +8,13 @@ use std::{
     str::FromStr,
     time::{Duration, Instant},
 };
-use sysinfo::{ProcessesToUpdate, System};
-use thiserror::Error;
-use url::Url;
 
+use data_encoding::HEXLOWER;
+use futures_util::StreamExt;
+#[cfg(feature = "alsa-backend")]
+use librespot::playback::mixer::alsamixer::AlsaMixer;
 use librespot::{
-    connect::{config::ConnectConfig, spirc::Spirc},
+    connect::{ConnectConfig, Spirc},
     core::{
         authentication::Credentials, cache::Cache, config::DeviceType, version, Session,
         SessionConfig,
@@ -33,9 +30,12 @@ use librespot::{
         player::{coefficient_to_duration, duration_to_coefficient, Player},
     },
 };
-
-#[cfg(feature = "alsa-backend")]
-use librespot::playback::mixer::alsamixer::AlsaMixer;
+use librespot_oauth::OAuthClientBuilder;
+use log::{debug, error, info, trace, warn};
+use sha1::{Digest, Sha1};
+use sysinfo::{ProcessesToUpdate, System};
+use thiserror::Error;
+use url::Url;
 
 mod player_event_handler;
 use player_event_handler::{run_program_on_sink_events, EventHandler};
@@ -1436,14 +1436,11 @@ fn get_setup() -> Setup {
                         #[cfg(feature = "alsa-backend")]
                         let default_value = &format!(
                             "{}, or the current value when the alsa mixer is used.",
-                            connect_default_config.initial_volume.unwrap_or_default()
+                            connect_default_config.initial_volume
                         );
 
                         #[cfg(not(feature = "alsa-backend"))]
-                        let default_value = &connect_default_config
-                            .initial_volume
-                            .unwrap_or_default()
-                            .to_string();
+                        let default_value = &connect_default_config.initial_volume.to_string();
 
                         invalid_error_msg(
                             INITIAL_VOLUME,
@@ -1479,7 +1476,7 @@ fn get_setup() -> Setup {
                         speaker, tv, avr, stb, audiodongle, \
                         gameconsole, castaudio, castvideo, \
                         automobile, smartwatch, chromebook, \
-                        carthing, homething",
+                        carthing",
                         DeviceType::default().into(),
                     );
 
@@ -1490,14 +1487,21 @@ fn get_setup() -> Setup {
 
         let is_group = opt_present(DEVICE_IS_GROUP);
 
-        let has_volume_ctrl = !matches!(mixer_config.volume_ctrl, VolumeCtrl::Fixed);
-
-        ConnectConfig {
-            name,
-            device_type,
-            is_group,
-            initial_volume,
-            has_volume_ctrl,
+        if let Some(initial_volume) = initial_volume {
+            ConnectConfig {
+                name,
+                device_type,
+                is_group,
+                initial_volume,
+                ..Default::default()
+            }
+        } else {
+            ConnectConfig {
+                name,
+                device_type,
+                is_group,
+                ..Default::default()
+            }
         }
     };
 
@@ -1874,7 +1878,7 @@ async fn main() {
             {
                 Ok(d) => break Some(d),
                 Err(e) => {
-                    sys.refresh_processes(ProcessesToUpdate::All);
+                    sys.refresh_processes(ProcessesToUpdate::All, true);
 
                     if System::uptime() <= 1 {
                         debug!("Retrying to initialise discovery: {e}");
@@ -1897,18 +1901,22 @@ async fn main() {
             Some(port) => format!(":{port}"),
             _ => String::new(),
         };
-        let access_token = match librespot::oauth::get_access_token(
+        let client = OAuthClientBuilder::new(
             &setup.session_config.client_id,
             &format!("http://127.0.0.1{port_str}/login"),
             OAUTH_SCOPES.to_vec(),
-        ) {
-            Ok(token) => token.access_token,
-            Err(e) => {
-                error!("Failed to get Spotify access token: {e}");
-                exit(1);
-            }
-        };
-        last_credentials = Some(Credentials::with_access_token(access_token));
+        )
+        .open_in_browser()
+        .build()
+        .unwrap_or_else(|e| {
+            error!("Failed to create OAuth client: {e}");
+            exit(1);
+        });
+        let oauth_token = client.get_access_token().unwrap_or_else(|e| {
+            error!("Failed to get Spotify access token: {e}");
+            exit(1);
+        });
+        last_credentials = Some(Credentials::with_access_token(oauth_token.access_token));
         connecting = true;
     } else if discovery.is_none() {
         error!(
