@@ -78,6 +78,11 @@ struct GetCurrentTrackRes {
     song_uri: String,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct GetCurrentVolumeRes {
+    volume: u16,
+}
+
 impl ApiServerTask {
 
     fn run(mut self) {
@@ -98,6 +103,9 @@ impl ApiServerTask {
             }
     
             let mut buf = [0u8; 1024];
+            let mut current_volume = GetCurrentVolumeRes{
+                volume: 0,
+            };
             let mut current_played_song = GetCurrentTrackRes {
                 song_name: String::new(),
                 song_id: String::new(),
@@ -152,8 +160,8 @@ impl ApiServerTask {
                             librespot_playback::player::PlayerEvent::Unavailable { play_request_id: _, track_id: _ } => {
 
                             },
-                            librespot_playback::player::PlayerEvent::VolumeChanged { volume: _ } => {
-
+                            librespot_playback::player::PlayerEvent::VolumeChanged { volume } => {
+                                current_volume.volume = volume;
                             },
                             librespot_playback::player::PlayerEvent::PositionCorrection { play_request_id: _, track_id: _, position_ms: _ } => {
                                 
@@ -264,6 +272,22 @@ impl ApiServerTask {
                                 if let Some(spirc) = &self.spirc {
                                     println!("calling volume up");
                                     let _ = spirc.volume_up();
+                                }
+                            }
+
+                            "getvol" => {
+                                match serde_json::to_string(&current_volume) {
+                                    Ok(json) => {
+                                        match socket.send_to(json.as_bytes(), data.1) {
+                                            Ok(_) => {},
+                                            Err(e) => {
+                                                println!("cannot send data to {}, {}", data.1.ip().to_string(), e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("cannot parse data to json, {}", e);
+                                    },
                                 }
                             }
 
