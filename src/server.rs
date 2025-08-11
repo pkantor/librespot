@@ -190,6 +190,7 @@ impl ApiServerTask {
                             librespot_playback::player::PlayerEvent::FilterExplicitContentChanged { filter: _ } => {
 
                             },
+                            librespot_playback::player::PlayerEvent::PositionChanged { play_request_id: _, track_id: _, position_ms: _} => {}
                         }
                     }
                     Err(_e) => {
