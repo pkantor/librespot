@@ -3,8 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::config::{os_version, OS};
+use crate::config::{OS, os_version};
 use crate::{
+    Error, FileId, SpotifyId,
     apresolve::SocketAddress,
     config::SessionConfig,
     error::ErrorKind,
@@ -21,15 +22,14 @@ use crate::{
     token::Token,
     util,
     version::spotify_semantic_version,
-    Error, FileId, SpotifyId,
 };
 use bytes::Bytes;
 use data_encoding::HEXUPPER_PERMISSIVE;
 use futures_util::future::IntoStream;
-use http::{header::HeaderValue, Uri};
+use http::{Uri, header::HeaderValue};
 use hyper::{
-    header::{HeaderName, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RANGE},
     HeaderMap, Method, Request,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, RANGE},
 };
 use hyper_util::client::legacy::ResponseFuture;
 use protobuf::{Enum, Message, MessageFull};
@@ -311,20 +311,12 @@ impl SpClient {
                                         continue;
                                     }
                                     Err(e) => {
-                                        trace!(
-                                            "Answer not accepted {}/{}: {}",
-                                            count,
-                                            MAX_TRIES,
-                                            e
-                                        );
+                                        trace!("Answer not accepted {count}/{MAX_TRIES}: {e}");
                                     }
                                 }
                             }
                             Err(e) => trace!(
-                                "Unable to solve hash cash challenge {}/{}: {}",
-                                count,
-                                MAX_TRIES,
-                                e
+                                "Unable to solve hash cash challenge {count}/{MAX_TRIES}: {e}"
                             ),
                         }
 
@@ -343,7 +335,7 @@ impl SpClient {
                 Some(unknown) => {
                     return Err(Error::unimplemented(format!(
                         "Unknown client token response type: {unknown:?}"
-                    )))
+                    )));
                 }
                 None => return Err(Error::failed_precondition("No client token response type")),
             }
@@ -373,7 +365,7 @@ impl SpClient {
             inner.client_token = Some(client_token);
         });
 
-        trace!("Got client token: {:?}", granted_token);
+        trace!("Got client token: {granted_token:?}");
 
         Ok(access_token)
     }
@@ -483,22 +475,26 @@ impl SpClient {
                     url,
                     "{}salt={}",
                     util::get_next_query_separator(&url),
-                    rand::thread_rng().next_u32()
+                    rand::rng().next_u32()
                 );
             }
 
             let mut request = Request::builder()
                 .method(method)
                 .uri(url)
+                .header(CONTENT_LENGTH, body.len())
                 .body(Bytes::copy_from_slice(body))?;
 
             // Reconnection logic: keep getting (cached) tokens because they might have expired.
             let token = self.session().login5().auth_token().await?;
 
             let headers_mut = request.headers_mut();
-            if let Some(ref hdrs) = headers {
-                *headers_mut = hdrs.clone();
+            if let Some(ref headers) = headers {
+                for (name, value) in headers {
+                    headers_mut.insert(name, value.clone());
+                }
             }
+
             headers_mut.insert(
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token,))?,
@@ -542,7 +538,7 @@ impl SpClient {
                 }
             }
 
-            debug!("Error was: {:?}", last_response);
+            debug!("Error was: {last_response:?}");
         }
 
         last_response
@@ -900,7 +896,9 @@ impl SpClient {
     pub async fn get_rootlist(&self, from: usize, length: Option<usize>) -> SpClientResult {
         let length = length.unwrap_or(120);
         let user = self.session().username();
-        let endpoint = format!("/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={from}&length={length}");
+        let endpoint = format!(
+            "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={from}&length={length}"
+        );
 
         self.request(&Method::GET, &endpoint, None, None).await
     }
