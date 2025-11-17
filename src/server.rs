@@ -1,13 +1,14 @@
 use std::{net::UdpSocket, thread, time::Duration};
 
 use librespot_connect::Spirc;
-use librespot_core::spotify_id::SpotifyItemType;
 use librespot_playback::player::PlayerEventChannel;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
 
 use log::debug;
 use thiserror::Error;
+
+const SPOTIFY_ITEM_TYPE_TRACK: &str = "track";
 
 #[derive(Debug, Error)]
 pub enum ApiServerError {
@@ -121,8 +122,8 @@ impl ApiServerTask {
                                 println!("changing currently played song to {}", audio_item.name);
                                 current_played_song.song_name = audio_item.name;
                                 current_played_song.song_uri = audio_item.uri;
-                                if audio_item.track_id.item_type == SpotifyItemType::Track {
-                                    current_played_song.song_id = audio_item.track_id.id.to_string();
+                                if audio_item.track_id.item_type() == SPOTIFY_ITEM_TYPE_TRACK {
+                                    current_played_song.song_id = audio_item.track_id.to_id().to_string();
                                 }
                                 match audio_item.unique_fields {
                                     librespot_metadata::audio::UniqueFields::Track { artists, album: _, album_artists: _, popularity: _, number: _, disc_number: _ } => {
@@ -130,6 +131,9 @@ impl ApiServerTask {
                                     }
                                     librespot_metadata::audio::UniqueFields::Episode { description: _, publish_time: _, show_name: _ } => {
                                         current_played_song.song_artists = Vec::new();
+                                    }
+                                    librespot_metadata::audio::UniqueFields::Local { artists: _, album: _, album_artists: _, number: _, disc_number: _, path: _} => {
+                                        current_played_song.song_artists = Vec::new();    
                                     }
                                 }
                             },
