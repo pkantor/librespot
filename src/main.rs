@@ -41,10 +41,8 @@ use url::Url;
 mod player_event_handler;
 use player_event_handler::{EventHandler, run_program_on_sink_events};
 
-
 mod server;
-
-use server::ApiServerHandler;
+use server::{AllowList, ApiServer, ApiServerConfig, DEFAULT_BIND_ADDR};
 
 fn device_id(name: &str) -> String {
     HEXLOWER.encode(&Sha1::digest(name.as_bytes()))
@@ -226,6 +224,7 @@ struct Setup {
     emit_sink_events: bool,
     zeroconf_ip: Vec<std::net::IpAddr>,
     zeroconf_backend: Option<DnsSdServiceBuilder>,
+    api_config: ApiServerConfig,
 }
 
 async fn get_setup() -> Setup {
@@ -289,6 +288,8 @@ async fn get_setup() -> Setup {
     const ZEROCONF_INTERFACE: &str = "zeroconf-interface";
     const ZEROCONF_BACKEND: &str = "zeroconf-backend";
     const LOCAL_FILE_DIR: &str = "local-file-dir";
+    const API_BIND: &str = "api-bind";
+    const API_ALLOW: &str = "api-allow";
 
     // Mostly arbitrary.
     const AP_PORT_SHORT: &str = "a";
@@ -342,6 +343,8 @@ async fn get_setup() -> Setup {
     const ZEROCONF_PORT_SHORT: &str = "z";
     const ZEROCONF_BACKEND_SHORT: &str = ""; // no short flag
     const LOCAL_FILE_DIR_SHORT: &str = "l";
+    const API_BIND_SHORT: &str = ""; // no short flag
+    const API_ALLOW_SHORT: &str = ""; // no short flag
 
     // Options that have different descriptions
     // depending on what backends were enabled at build time.
@@ -672,6 +675,16 @@ async fn get_setup() -> Setup {
         LOCAL_FILE_DIR,
         "Directory to search for local file playback. Can be specified multiple times to add multiple search directories",
         "DIRECTORY"
+    ).optopt(
+        API_BIND_SHORT,
+        API_BIND,
+        "Address the UDP control API binds to. Defaults to 0.0.0.0:50505.",
+        "ADDRESS"
+    ).optopt(
+        API_ALLOW_SHORT,
+        API_ALLOW,
+        "Comma-separated IP addresses and CIDR networks allowed to use the control API, e.g. '172.30.2.0/24'. Defaults to allowing everyone.",
+        "NETWORKS"
     );
 
     #[cfg(feature = "passthrough-decoder")]
@@ -1846,6 +1859,32 @@ async fn get_setup() -> Setup {
     let player_event_program = opt_str(ONEVENT);
     let emit_sink_events = opt_present(EMIT_SINK_EVENTS);
 
+    let api_config = {
+        let bind_addr = opt_str(API_BIND).unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+
+        let allow_list = opt_str(API_ALLOW)
+            .map(|networks| {
+                networks.parse::<AllowList>().unwrap_or_else(|e| {
+                    invalid_error_msg(
+                        API_ALLOW,
+                        API_ALLOW_SHORT,
+                        &networks,
+                        "comma-separated IP addresses and CIDR networks, e.g. '172.30.2.0/24'",
+                        "",
+                    );
+                    error!("{e}");
+
+                    exit(1);
+                })
+            })
+            .unwrap_or_default();
+
+        ApiServerConfig {
+            bind_addr,
+            allow_list,
+        }
+    };
+
     Setup {
         format,
         backend,
@@ -1864,6 +1903,7 @@ async fn get_setup() -> Setup {
         emit_sink_events,
         zeroconf_ip,
         zeroconf_backend,
+        api_config,
     }
 }
 
@@ -2012,10 +2052,12 @@ async fn main() {
         }
     }
 
-    let api_server = ApiServerHandler::spawn(player.get_player_event_channel()).await.unwrap_or_else(|e| {
-        error!("could not initialize API : {}", e);
-        exit(1);
-    });
+    let api_server = ApiServer::spawn(setup.api_config, player.get_player_event_channel())
+        .await
+        .unwrap_or_else(|e| {
+            error!("could not start the API server: {e}");
+            exit(1);
+        });
 
     loop {
         tokio::select! {
@@ -2107,7 +2149,7 @@ async fn main() {
                 exit(1);
             },
             _ = tokio::signal::ctrl_c() => {
-                println!("received Ctrl+C");
+                debug!("received Ctrl+C");
                 break;
             },
             else => break,
@@ -2118,7 +2160,7 @@ async fn main() {
 
     let mut shutdown_tasks = tokio::task::JoinSet::new();
 
-    shutdown_tasks.spawn(api_server.quit_and_join());
+    shutdown_tasks.spawn(api_server.shutdown());
 
     // Shutdown spirc if necessary
     if let Some(spirc) = spirc {
