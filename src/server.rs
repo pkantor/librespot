@@ -578,7 +578,7 @@ impl ApiServerTask {
 
     async fn handle_request(&mut self, datagram: &[u8], peer: SocketAddr) {
         if !self.allow_list.allows(peer.ip()) {
-            debug!("ignoring a datagram from {peer}: not on the allow list");
+            warn!("rejecting a datagram from {peer}: not on the allow list");
             return;
         }
 
@@ -616,7 +616,7 @@ impl ApiServerTask {
                     .insert(peer, Instant::now() + SUBSCRIPTION_LEASE)
                     .is_none()
                 {
-                    debug!("{peer} subscribed to API events");
+                    info!("{peer} subscribed to API events");
                 }
 
                 // answering with the full state makes every keepalive a re-sync
@@ -624,7 +624,7 @@ impl ApiServerTask {
             }
             "unsubscribe" => {
                 if self.subscribers.remove(&peer).is_some() {
-                    debug!("{peer} unsubscribed from API events");
+                    info!("{peer} unsubscribed from API events");
                 }
             }
             other => warn!("unknown command: {other}"),
@@ -660,7 +660,7 @@ impl ApiServerTask {
             let alive = *lease > now;
 
             if !alive {
-                debug!("subscription of {peer} expired");
+                info!("subscription of {peer} expired");
             }
 
             alive
