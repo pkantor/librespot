@@ -5,6 +5,11 @@ pre-build = [
     "apt-get --assume-yes install libssl-dev:$CROSS_DEB_ARCH libasound2-dev:$CROSS_DEB_ARCH",
 ]
 
+[build.env]
+# fork-specific: rpi-release.yml stamps the build version into the binary, and the compiler
+# only sees it if cross forwards it into the container
+passthrough = ["LIBRESPOT_BUILD_VERSION"]
+
 [target.riscv64gc-unknown-linux-gnu]
 # RISC-V: Uses rustls-tls (no system dependencies needed)
 # Building with --no-default-features --features rustls-tls

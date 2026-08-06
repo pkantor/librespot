@@ -165,8 +165,14 @@ fn get_version_string() -> String {
     #[cfg(not(debug_assertions))]
     const BUILD_PROFILE: &str = "release";
 
+    // stamped in by the fork's release workflow as year.month.day[.nth build that day];
+    // absent in local builds, where the commit sha is identification enough
+    let build_version = option_env!("LIBRESPOT_BUILD_VERSION")
+        .map(|version| format!(" build {version}"))
+        .unwrap_or_default();
+
     format!(
-        "librespot {semver} {sha} (Built on {build_date}, Build ID: {build_id}, Profile: {build_profile})",
+        "librespot {semver}{build_version} {sha} (Built on {build_date}, Build ID: {build_id}, Profile: {build_profile})",
         semver = version::SEMVER,
         sha = version::SHA_SHORT,
         build_date = version::BUILD_DATE,
@@ -683,7 +689,7 @@ async fn get_setup() -> Setup {
     ).optopt(
         API_ALLOW_SHORT,
         API_ALLOW,
-        "Comma-separated IP addresses and CIDR networks allowed to use the control API, e.g. '172.30.2.0/24'. Defaults to allowing everyone.",
+        "Comma-separated IP addresses and CIDR networks allowed to use the control API, e.g. '172.30.2.0/24'. Loopback is always allowed. Defaults to allowing everyone.",
         "NETWORKS"
     );
 
@@ -1039,7 +1045,7 @@ async fn get_setup() -> Setup {
                         } else {
                             error!(
                                 "Could not find an alsa mixer for \"{}\", it must be specified with `--{}` / `-{}`",
-                                &device.unwrap_or_default(),
+                                device.unwrap_or_default(),
                                 ALSA_MIXER_DEVICE,
                                 ALSA_MIXER_DEVICE_SHORT
                             );

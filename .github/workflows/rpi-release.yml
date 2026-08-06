@@ -1,0 +1,105 @@
+---
+# Fork-specific: cross-compiles the API branch for 64-bit Raspberry Pi and publishes the binary
+# as a release, so the Pi only has to download it (contrib/rpi-update.sh).
+# Driven by pipeline.yml — this is the last stage, reached only if the checks before it pass.
+#
+# Each build gets its own tag and is marked as the latest release, which is what makes
+# /releases/latest/download/<asset> a stable URL. Nothing is ever deleted or overwritten:
+# the repository has immutable releases enabled, so a reused tag is rejected outright.
+name: rpi-release
+
+"on":
+  workflow_call:
+  workflow_dispatch: # to re-publish without running the whole pipeline
+
+env:
+  RUST_BACKTRACE: 1
+  # Prefixed on purpose: workflow-level env leaks into every action, and plain names like
+  # TAG or TARGET are read by the tooling inside actions-rust-cross (its ubi installer picked
+  # up TAG and tried to fetch a release of its own by that name).
+  RPI_TARGET: aarch64-unknown-linux-gnu
+  # published uncompressed, so pulling it on the Pi is a single curl with no unpacking
+  RPI_ASSET: librespot-aarch64
+  # rustls instead of native-tls: the cross image links against an OpenSSL the Pi does not have.
+  # This leaves glibc and libasound.so.2 as the only shared dependencies.
+  # Comma-separated so it survives whatever tokenization the build action applies to `args`.
+  RPI_FEATURES: rustls-tls-native-roots,alsa-backend,with-libmdns
+
+jobs:
+  build:
+    name: build and publish aarch64 binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to create the release
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the build tags are the counter, so the history must carry them
+
+      - name: Work out the build version
+        run: |
+          # year.month.day, no leading zeros, plus .N for the N-th extra build of the day
+          date=$(date -u +%y.%-m.%-d)
+          today=$(git tag -l "$date" -l "$date.*" | wc -l | tr -d ' ')
+
+          if [ "$today" -eq 0 ]; then
+            version="$date"
+          else
+            version="$date.$today"
+          fi
+
+          echo "LIBRESPOT_BUILD_VERSION=$version" >> "$GITHUB_ENV"
+          echo "building $version"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # cross builds into target/<triple>, and the cache must not be shared with the
+          # host-side jobs that compile the same crates for x86_64
+          key: ${{ env.RPI_TARGET }}
+
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v1
+        env:
+          # this workflow ships an artifact, so a new lint must not block a deploy;
+          # stripping keeps the binary at a size that is quick to pull over the LAN
+          RUSTFLAGS: -C strip=symbols
+        with:
+          command: build
+          target: ${{ env.RPI_TARGET }}
+          toolchain: stable
+          args: --locked --release --no-default-features --features ${{ env.RPI_FEATURES }}
+
+      # last, so a failed build neither burns a version number nor moves the download URL
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp "target/$RPI_TARGET/release/librespot" "$RPI_ASSET"
+
+          # --target pins the tag to the built commit; without it gh tags the default branch.
+          # --latest is what keeps /releases/latest/download/ pointing here.
+          gh release create "$LIBRESPOT_BUILD_VERSION" \
+            --target "$GITHUB_SHA" \
+            --latest \
+            --title "librespot ${LIBRESPOT_BUILD_VERSION} ($(git rev-parse --short HEAD))" \
+            --notes "Build \`${LIBRESPOT_BUILD_VERSION}\` of \`${GITHUB_REF_NAME}\` at \`$(git rev-parse HEAD)\`, $(date -u '+%Y-%m-%d %H:%M UTC').
+
+          Target: \`${RPI_TARGET}\`
+          Features: \`${RPI_FEATURES}\`
+
+          Download on the Pi:
+
+          \`\`\`
+          curl -fsSL -o librespot https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/${RPI_ASSET}
+          \`\`\`" \
+            "$RPI_ASSET"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: librespot-aarch64
+          path: ${{ env.RPI_ASSET }}
+          if-no-files-found: error
