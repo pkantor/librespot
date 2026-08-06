@@ -587,7 +587,13 @@ impl ApiServerTask {
         let command = parts.next().unwrap_or_default();
         let payload = parts.next().unwrap_or_default().trim();
 
-        debug!("received '{command}' from {peer}");
+        // subscription keepalives arrive every lease period, so they stay at `debug`;
+        // everything else is a user-triggered command and is worth seeing without RUST_LOG
+        if matches!(command, "subscribe" | "unsubscribe") {
+            debug!("received '{command}' from {peer}");
+        } else {
+            info!("received '{command}' from {peer}");
+        }
 
         match command {
             "next" => self.command(command, Spirc::next),
@@ -605,7 +611,7 @@ impl ApiServerTask {
                     debug!("setting volume to {percentage:.2}%");
                     self.command(command, |spirc| spirc.set_volume(request.volume));
                 }
-                Err(e) => warn!("invalid `setvol` payload '{payload}': {e}"),
+                Err(e) => warn!("invalid `setvol` payload '{payload}' from {peer}: {e}"),
             },
             "getvol" => self.reply(&self.current_volume, peer).await,
             "current_track" => self.reply(&self.current_track, peer).await,
@@ -627,7 +633,7 @@ impl ApiServerTask {
                     info!("{peer} unsubscribed from API events");
                 }
             }
-            other => warn!("unknown command: {other}"),
+            other => warn!("unknown command '{other}' from {peer}"),
         }
     }
 
