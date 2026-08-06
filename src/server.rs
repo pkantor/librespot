@@ -112,7 +112,8 @@ pub enum AllowListError {
 /// The IP networks allowed to talk to the API.
 ///
 /// The API has no authentication of its own, so this is the only thing between the control socket
-/// and the rest of the network. An empty list allows everyone.
+/// and the rest of the network. An empty list allows everyone; loopback is always allowed, since
+/// anything on this host can talk to the process directly anyway.
 #[derive(Debug, Default, Clone)]
 pub struct AllowList(Vec<IpNetwork>);
 
@@ -132,6 +133,11 @@ impl AllowList {
             IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, IpAddr::V4),
             v4 => v4,
         };
+
+        // implicit, so a local client never has to be spelled out on the command line
+        if addr.is_loopback() {
+            return true;
+        }
 
         self.0.iter().any(|network| network.contains(addr))
     }
@@ -890,8 +896,22 @@ mod tests {
         assert!(!allow_list.allows("10.1.2.4".parse().unwrap()));
 
         // v4 rules don't cover v6 peers, but do cover v4 mapped ones
-        assert!(!allow_list.allows("::1".parse().unwrap()));
+        assert!(!allow_list.allows("fd00::1".parse().unwrap()));
         assert!(allow_list.allows("::ffff:172.30.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn loopback_is_allowed_without_being_listed() {
+        let allow_list: AllowList = "172.30.2.0/24".parse().expect("parses");
+
+        assert!(allow_list.allows("127.0.0.1".parse().unwrap()));
+        // the whole 127.0.0.0/8 block, however it arrives at a dual stack socket
+        assert!(allow_list.allows("127.0.0.53".parse().unwrap()));
+        assert!(allow_list.allows("::1".parse().unwrap()));
+        assert!(allow_list.allows("::ffff:127.0.0.1".parse().unwrap()));
+
+        // and it does not weaken anything else
+        assert!(!allow_list.allows("172.30.3.1".parse().unwrap()));
     }
 
     #[test]
@@ -935,28 +955,39 @@ mod tests {
         _cmd_tx: mpsc::UnboundedSender<ApiServerCommand>,
     }
 
+    /// A task on a loopback port that is not running its loop yet, plus the handles to drive it.
+    /// Tests that only need `handle_request` can use it directly and skip the socket.
+    async fn idle_task(
+        allow_list: AllowList,
+    ) -> (
+        ApiServerTask,
+        mpsc::UnboundedSender<PlayerEvent>,
+        mpsc::UnboundedSender<ApiServerCommand>,
+    ) {
+        let (events, player_events) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        let task = ApiServerTask {
+            socket: UdpSocket::bind("127.0.0.1:0").await.expect("binds"),
+            allow_list,
+            spirc: None,
+            cmd_rx,
+            player_events,
+            subscribers: HashMap::new(),
+            current_track: TrackResponse::default(),
+            current_volume: VolumeResponse::default(),
+            playback: PlaybackState::default(),
+        };
+
+        (task, events, cmd_tx)
+    }
+
     impl TestServer {
         async fn start(allow_list: AllowList) -> Self {
-            let (events, player_events) = mpsc::unbounded_channel();
-            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let (task, events, cmd_tx) = idle_task(allow_list).await;
+            let addr = task.socket.local_addr().expect("has an address");
 
-            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("binds");
-            let addr = socket.local_addr().expect("has an address");
-
-            tokio::spawn(
-                ApiServerTask {
-                    socket,
-                    allow_list,
-                    spirc: None,
-                    cmd_rx,
-                    player_events,
-                    subscribers: HashMap::new(),
-                    current_track: TrackResponse::default(),
-                    current_volume: VolumeResponse::default(),
-                    playback: PlaybackState::default(),
-                }
-                .run(),
-            );
+            tokio::spawn(task.run());
 
             Self {
                 addr,
@@ -1047,14 +1078,32 @@ mod tests {
 
     #[tokio::test]
     async fn the_allow_list_keeps_others_from_subscribing() {
-        // the client talks from 127.0.0.1, which this does not cover
+        // driven directly rather than over the socket, because a test client is always on
+        // loopback and loopback is allowed unconditionally
+        let (mut task, ..) = idle_task("172.30.2.0/24".parse().expect("parses")).await;
+
+        task.handle_request(b"subscribe", "8.8.8.8:1234".parse().expect("parses"))
+            .await;
+        assert!(
+            task.subscribers.is_empty(),
+            "a client outside the allow list should be dropped before its command is read"
+        );
+
+        task.handle_request(b"subscribe", "172.30.2.5:1234".parse().expect("parses"))
+            .await;
+        assert_eq!(
+            task.subscribers.len(),
+            1,
+            "a listed client should be served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_client_is_served_without_being_listed() {
         let server = TestServer::start("172.30.2.0/24".parse().expect("parses")).await;
 
         server.request("subscribe").await;
 
-        assert!(
-            server.receives_nothing().await,
-            "a client outside the allow list should be ignored"
-        );
+        assert_eq!(server.receive().await["event"], "snapshot");
     }
 }

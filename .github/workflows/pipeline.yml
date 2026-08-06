@@ -1,0 +1,88 @@
+---
+# Fork-specific: the single entry point for pushes to API.
+#
+# Deliberately leaner than upstream's build.yml/quality.yml, which fan out over Windows, MSRV
+# and every feature combination. This fork ships one binary to one Raspberry Pi, so the checks
+# here cover the host (fmt, clippy, tests) and the feature set that actually goes on the Pi;
+# the target-specific compile is the release build itself. Upstream's workflows are untouched
+# and still run on dev/master if a merge needs the wider coverage.
+name: pipeline
+
+"on":
+  push:
+    branches: [API]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+  workflow_dispatch:
+
+# a newer push makes an in-flight pipeline obsolete
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  # what the Pi runs — see rpi-release.yml
+  SHIPPED_FEATURES: rustls-tls-native-roots,alsa-backend,with-libmdns
+
+jobs:
+  # quality and test run in parallel: both compile the workspace, so serializing them would
+  # double the wall time for no extra signal. The release still waits for both.
+  quality:
+    name: code quality
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install package dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy with default features
+        run: cargo clippy --workspace --all-targets
+
+      - name: Run clippy with the features shipped to the Pi
+        run: >
+          cargo clippy -p librespot --all-targets
+          --no-default-features --features ${{ env.SHIPPED_FEATURES }}
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install package dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  rpi-release:
+    name: publish for the Pi
+    needs: [quality, test]
+    permissions:
+      contents: write # the called workflow creates a release
+    uses: ./.github/workflows/rpi-release.yml
