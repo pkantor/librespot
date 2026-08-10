@@ -8,3 +8,4 @@ spotify_appkey.key
 .cache
 *.save
 *.*~
+contrib/__pycache__

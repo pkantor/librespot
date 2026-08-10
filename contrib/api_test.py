@@ -8,27 +8,53 @@ what a client has to do.
     ./api_test.py [host] [port]
     ./api_test.py 172.30.2.10          # the device on its own machine
     ./api_test.py --raw                # print the JSON as it comes in
+    ./api_test.py --covers ./art       # write every cover received to a directory
 
 Commands to type once it runs:
 
     next / pause / resume / volup / voldown
     setvol {"volume": 32768}
     status / current_track / getvol
+
+What a client has to get right, all of which this script demonstrates:
+
+  * subscribe once, then renew with `subscribe_refresh`. The refresh answers with the same
+    snapshot minus the cover bytes, which keeps a keepalive to one small datagram.
+  * a track carries its cover as bytes (`cover_data`, base64) and by no other means. When
+    the server reports a `song_uri` you have no cover for — which happens when the
+    `track_changed` push was lost, it being the only fragmented datagram — ask
+    `current_track` to get the picture.
+  * receive into a buffer of ~128 kB. A track event carrying a cover is tens of kB and
+    arrives fragmented; on Windows a short buffer does not truncate like on Linux, it fails
+    the whole `recvfrom` with WSAEMSGSIZE and the event is lost.
+  * `cover_data` is simply empty when there is no picture to be had. There are no
+    substitutes and no urls to fall back to.
 """
 
 import argparse
+import base64
 import json
-import selectors
+import queue
 import socket
 import sys
+import threading
 import time
+from pathlib import Path
 
 DEFAULT_PORT = 50505
 
 # The server drops a subscription after 30s. Refreshing every 10s survives two lost
-# keepalives, and each refresh answers with a full snapshot, which re-syncs the client
-# after a dropped event.
+# keepalives, and each refresh answers with a snapshot, which re-syncs the client after a
+# dropped event.
 KEEPALIVE_SECONDS = 10
+
+# Big enough for a track event with its cover; see the note about WSAEMSGSIZE above.
+RECV_BUFFER = 128 * 1024
+
+# Room for a few of those events, in case this client is busy when they arrive.
+SOCKET_BUFFER = 1024 * 1024
+
+EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
 
 
 def format_position(position_ms, duration_ms=0):
@@ -38,6 +64,11 @@ def format_position(position_ms, duration_ms=0):
         return f"{position} / {duration_ms // 60000}:{duration_ms // 1000 % 60:02d}"
 
     return position
+
+
+def decoded_size(data):
+    """How many bytes of picture a base64 string holds, without decoding it."""
+    return len(data) * 3 // 4 - data.count("=")
 
 
 def format_track(track):
@@ -50,8 +81,14 @@ def format_track(track):
         line += f" - {artists}"
     if album:
         line += f" [{album}]"
-    if track.get("cover_url"):
-        line += f"\n    cover: {track['cover_url']}"
+
+    cover = track.get("cover_data") or ""
+    if cover:
+        line += (
+            f"\n    cover: {track.get('cover_mime', '?')} "
+            f"{track.get('cover_width', 0)}x{track.get('cover_height', 0)}, "
+            f"{decoded_size(cover) / 1024:.1f} kB"
+        )
 
     return line
 
@@ -85,7 +122,79 @@ def format_event(payload):
         volume = payload.get("volume", 0)
         return f"volume_changed: {volume} ({volume / 65535 * 100:.0f}%)"
 
+    if "song_uri" in payload:  # the answer to current_track
+        return f"current_track: {format_track(payload)}"
+
     return f"{event}: {json.dumps(payload)}"
+
+
+def shorten(payload):
+    """The payload with the cover replaced by its size — 27 kB of base64 unreadable."""
+    payload = dict(payload)
+    track = payload.get("track")
+
+    if isinstance(track, dict):
+        payload["track"] = shorten(track)
+    elif payload.get("cover_data"):
+        payload["cover_data"] = f"<{decoded_size(payload['cover_data'])} bytes>"
+
+    return payload
+
+
+def track_of(payload):
+    """The track a payload carries, be it an event or the answer to `current_track`."""
+    track = payload.get("track")
+
+    if isinstance(track, dict):
+        return track
+
+    return payload if "song_uri" in payload else None
+
+
+def read_stdin(commands):
+    """Reads commands on a thread, since selecting on stdin does not work on Windows."""
+    for line in sys.stdin:
+        commands.put(line.strip())
+
+    commands.put(None)
+
+
+class Client:
+    def __init__(self, sock, server, covers_dir):
+        self.sock = sock
+        self.server = server
+        self.covers_dir = covers_dir
+        # what we hold a picture for, and what we last asked about, so that a track without
+        # a cover on the server is asked about once rather than at every keepalive
+        self.cover_of = None
+        self.asked_about = None
+
+    def send(self, command):
+        self.sock.sendto(command.encode(), self.server)
+
+    def on_track(self, track):
+        uri = track.get("song_uri") or ""
+        cover = track.get("cover_data") or ""
+
+        if cover:
+            self.cover_of = uri
+            self.asked_about = None
+            self.save_cover(track, base64.b64decode(cover))
+        elif uri and uri != self.cover_of and uri != self.asked_about:
+            # the push that carried it must have been lost; this is the repair path
+            self.asked_about = uri
+            print("    no cover for this track, asking for it", flush=True)
+            self.send("current_track")
+
+    def save_cover(self, track, cover):
+        if not self.covers_dir:
+            return
+
+        name = track.get("song_id") or track.get("song_uri", "cover").replace(":", "_")
+        path = self.covers_dir / f"{name}{EXTENSIONS.get(track.get('cover_mime'), '.bin')}"
+        path.write_bytes(cover)
+
+        print(f"    saved {len(cover)} bytes to {path}", flush=True)
 
 
 def main():
@@ -95,55 +204,76 @@ def main():
     parser.add_argument(
         "--raw", action="store_true", help="print the JSON instead of a summary"
     )
+    parser.add_argument(
+        "--covers", type=Path, help="write every cover received to this directory"
+    )
     args = parser.parse_args()
+
+    if args.covers:
+        args.covers.mkdir(parents=True, exist_ok=True)
 
     server = (args.host, args.port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER)
+    sock.settimeout(1)
 
-    selector = selectors.DefaultSelector()
-    selector.register(sock, selectors.EVENT_READ, "socket")
-    selector.register(sys.stdin, selectors.EVENT_READ, "stdin")
+    client = Client(sock, server, args.covers)
+
+    commands = queue.Queue()
+    threading.Thread(target=read_stdin, args=(commands,), daemon=True).start()
 
     print(
         f"subscribing to {args.host}:{args.port} — type commands, ctrl-c to quit",
         flush=True,
     )
-    sock.sendto(b"subscribe", server)
+    client.send("subscribe")
     last_keepalive = time.monotonic()
 
     try:
         while True:
-            for key, _ in selector.select(timeout=1):
-                if key.data == "socket":
-                    datagram, _ = sock.recvfrom(65535)
+            try:
+                datagram, _ = sock.recvfrom(RECV_BUFFER)
+            except socket.timeout:
+                datagram = None
+            except OSError as e:
+                # what a buffer shorter than RECV_BUFFER would get you on Windows
+                print(f"receive failed: {e}", flush=True)
+                datagram = None
 
-                    try:
-                        payload = json.loads(datagram)
-                    except json.JSONDecodeError:
-                        print(f"not json: {datagram!r}", flush=True)
-                        continue
+            if datagram is not None:
+                try:
+                    payload = json.loads(datagram)
+                except json.JSONDecodeError:
+                    print(f"not json: {datagram!r}", flush=True)
+                    payload = None
 
-                    if args.raw:
-                        print(json.dumps(payload), flush=True)
-                    else:
-                        print(format_event(payload), flush=True)
-                else:
-                    command = sys.stdin.readline()
+                if payload is not None:
+                    print(
+                        json.dumps(shorten(payload)) if args.raw else format_event(payload),
+                        flush=True,
+                    )
 
-                    if not command:  # stdin closed
-                        selector.unregister(sys.stdin)
-                        continue
+                    track = track_of(payload)
+                    if track is not None:
+                        client.on_track(track)
 
-                    if command.strip():
-                        sock.sendto(command.strip().encode(), server)
+            while True:
+                try:
+                    command = commands.get_nowait()
+                except queue.Empty:
+                    break
+
+                if command:
+                    client.send(command)
 
             now = time.monotonic()
 
             if now - last_keepalive >= KEEPALIVE_SECONDS:
-                sock.sendto(b"subscribe", server)
+                # not `subscribe`: renewing must not drag the cover along every ten seconds
+                client.send("subscribe_refresh")
                 last_keepalive = now
     except KeyboardInterrupt:
-        sock.sendto(b"unsubscribe", server)
+        client.send("unsubscribe")
         print("\nunsubscribed", flush=True)
 
 

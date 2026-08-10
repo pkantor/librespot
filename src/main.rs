@@ -2119,7 +2119,7 @@ async fn main() {
                     }
                 };
 
-                api_server.set_spirc(spirc_.clone());
+                api_server.set_session(spirc_.clone(), session.clone());
                 spirc = Some(spirc_);
                 spirc_task = Some(Box::pin(spirc_task_));
 

@@ -6,27 +6,41 @@
 //! `<command>[ <json payload>]`. Commands that query state answer with a JSON datagram sent back
 //! to the requesting socket:
 //!
-//! | command         | payload             | response                   |
-//! |-----------------|---------------------|----------------------------|
-//! | `next`          | -                   | -                          |
-//! | `pause`         | -                   | -                          |
-//! | `resume`        | -                   | -                          |
-//! | `volup`         | -                   | -                          |
-//! | `voldown`       | -                   | -                          |
-//! | `setvol`        | `{"volume":<u16>}`  | -                          |
-//! | `getvol`        | -                   | [`VolumeResponse`] as JSON |
-//! | `current_track` | -                   | [`TrackResponse`] as JSON  |
-//! | `status`        | -                   | `snapshot` event as JSON   |
-//! | `subscribe`     | -                   | `snapshot` event as JSON   |
-//! | `unsubscribe`   | -                   | -                          |
+//! | command             | payload             | response                        |
+//! |---------------------|---------------------|---------------------------------|
+//! | `next`              | -                   | -                               |
+//! | `pause`             | -                   | -                               |
+//! | `resume`            | -                   | -                               |
+//! | `volup`             | -                   | -                               |
+//! | `voldown`           | -                   | -                               |
+//! | `setvol`            | `{"volume":<u16>}`  | -                               |
+//! | `getvol`            | -                   | [`VolumeResponse`] as JSON      |
+//! | `current_track`     | -                   | [`TrackResponse`] as JSON       |
+//! | `status`            | -                   | `snapshot` event as JSON        |
+//! | `subscribe`         | -                   | `snapshot` event as JSON        |
+//! | `subscribe_refresh` | -                   | `snapshot` without cover bytes  |
+//! | `unsubscribe`       | -                   | -                               |
 //!
 //! # Push events
 //!
 //! `subscribe` registers the sender for push events for [`SUBSCRIPTION_LEASE`] and answers with a
-//! `snapshot` of the full state. Clients are expected to re-send `subscribe` well within the lease
-//! as a keepalive; that also re-syncs them, so a dropped datagram leaves a client stale for at
-//! most one keepalive interval instead of indefinitely. A client that goes away silently is
-//! dropped when its lease runs out; `unsubscribe` deregisters it right away.
+//! `snapshot` of the full state. Clients are expected to renew well within the lease as a
+//! keepalive; that also re-syncs them, so a dropped datagram leaves a client stale for at most one
+//! keepalive interval instead of indefinitely. A client that goes away silently is dropped when
+//! its lease runs out; `unsubscribe` deregisters it right away.
+//!
+//! `subscribe_refresh` is the keepalive to renew with. It answers with the same `snapshot`, minus
+//! the cover bytes the client already has, which is what keeps a keepalive down to one small
+//! datagram instead of a fragmented one — see the cover section below. It registers a sender that
+//! isn't subscribed yet just as `subscribe` would, so a client can lose its lease and keep going.
+//!
+//! A client therefore subscribes once, renews with `subscribe_refresh`, and takes the cover from
+//! the `track_changed` it gets pushed. The one case that leaves it without a picture is a lost
+//! `track_changed` — the only event carrying a cover, and so the only one that travels
+//! fragmented — after which a keepalive reports a `song_uri` the client has no cover for. The rule
+//! that repairs it, and startup, and a client that dropped its cache, is: **ask `current_track`
+//! whenever you don't have the cover for the `song_uri` last reported**. The server keeps no
+//! record of who has what.
 //!
 //! Events are JSON datagrams discriminated by their `event` field:
 //!
@@ -40,28 +54,55 @@
 //! `position_ms` is always valid at the moment the datagram is sent, so a client extrapolates it
 //! against its own clock (`position_ms` plus the time since the datagram arrived, while
 //! `is_playing`) and never has to agree with this machine on what time it is.
+//!
+//! # Cover art
+//!
+//! A track carries its cover as bytes (`cover_data`, base64) and by no other means: the clients
+//! here cannot reach the internet, so the urls Spotify offers are not reported at all — only the
+//! Pi ever follows one. The picture is fetched once per track no matter how many clients are
+//! listening, and the last few are cached, so skipping back and forth doesn't refetch.
+//!
+//! `cover_data` is empty whenever there is no picture to be had — nothing on offer big enough to
+//! display, a failed or slow fetch, no session yet. That is a case clients have to handle anyway,
+//! so no effort is spent on second-best substitutes.
+//!
+//! That makes any datagram carrying a track a few tens of kB, well past the MTU, so it travels as
+//! a fragmented datagram rather than a single packet. Two things follow for clients:
+//!
+//! - the receive buffer has to be at least [`MAX_COVER_BYTES`] plus change; 128 kB is a safe size.
+//!   Note that a short buffer is not merely truncating on Windows: `recvfrom` fails with
+//!   `WSAEMSGSIZE` and drops the datagram whole,
+//! - the kernel reassembles the fragments, so a client still reads one whole event in one `recv`,
+//!   or nothing at all — but losing any single fragment loses the whole event, which the keepalive
+//!   repairs at the next lease at the latest.
+//!
+//! Only the datagrams that actually carry a cover are that big, which is why the keepalive is
+//! `subscribe_refresh` rather than `subscribe`: a client re-syncs every few seconds, but it only
+//! takes the fragmented path when the track changed under it.
+//!
+//! On Linux — what this runs on — a datagram may be up to 65507 bytes, comfortably more than a
+//! cover needs. macOS caps outgoing datagrams at `net.inet.udp.maxdgram`, 9216 by default, so a
+//! server run there fails to send covers until that sysctl is raised.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
     str::FromStr,
     time::{Duration, Instant},
 };
 
+use data_encoding::BASE64;
 use librespot::{
     connect::Spirc,
-    core::Error,
-    metadata::{
-        audio::{AudioItem, UniqueFields, item::CoverImage},
-        image::ImageSize,
-    },
+    core::{Error, Session},
+    metadata::audio::{AudioItem, UniqueFields, item::CoverImage},
     playback::player::{PlayerEvent, PlayerEventChannel},
 };
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
 
 /// The address the control API listens on by default.
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:50505";
@@ -70,8 +111,25 @@ pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:50505";
 /// third of that, so that a lost keepalive doesn't cost them their subscription.
 pub const SUBSCRIPTION_LEASE: Duration = Duration::from_secs(30);
 
-/// Datagrams larger than this are truncated. Commands are short, only `setvol` carries a payload.
+/// Incoming datagrams larger than this are truncated. Commands are short, only `setvol` carries a
+/// payload. Answers are not bound by this — one carrying a cover runs to tens of kB.
 const MAX_DATAGRAM_SIZE: usize = 1024;
+
+/// The cover that gets shipped is the smallest one Spotify offers that is still at least this
+/// wide. Clients scale down for display, which keeps the Pi out of the business of decoding and
+/// resizing pictures, and keeps the datagram down to what anyone actually looks at.
+const COVER_MIN_WIDTH: i32 = 200;
+
+/// Covers bigger than this are dropped, and the track goes out without one. A picture this size is
+/// far past what [`COVER_MIN_WIDTH`] asks for, so hitting this means something is off — and it is
+/// more fragments to lose than a cover is worth.
+pub const MAX_COVER_BYTES: usize = 64 * 1024;
+
+/// How long a cover fetch may take before the track event goes out without it.
+const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many covers to keep, so that skipping back and forth doesn't refetch them.
+const COVER_CACHE_SIZE: usize = 4;
 
 const SPOTIFY_ITEM_TYPE_TRACK: &str = "track";
 
@@ -225,7 +283,23 @@ fn prefix_matches(network: &[u8], addr: &[u8], prefix_len: u8) -> bool {
 }
 
 enum ApiServerCommand {
-    SetSpirc(Spirc),
+    SetSession { spirc: Spirc, session: Session },
+}
+
+/// A cover fetched off the loop, on its way back to the task that asked for it.
+struct CoverFetched {
+    /// The url it was fetched from, which is what the cache and the pending track key on.
+    url: String,
+    /// `None` when it could not be fetched; the track then goes out without a cover.
+    cover: Option<Cover>,
+}
+
+/// Cover bytes, ready to go into a datagram.
+#[derive(Debug, Clone)]
+struct Cover {
+    /// Base64, since the wire format is JSON.
+    data: String,
+    mime: &'static str,
 }
 
 /// Handle to the running API server task.
@@ -260,18 +334,24 @@ impl ApiServer {
         }
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cover_tx, cover_rx) = mpsc::unbounded_channel();
 
         let task = tokio::spawn(
             ApiServerTask {
                 socket,
                 allow_list: config.allow_list,
                 spirc: None,
+                session: None,
                 cmd_rx,
                 player_events,
                 subscribers: HashMap::new(),
                 current_track: TrackResponse::default(),
                 current_volume: VolumeResponse::default(),
                 playback: PlaybackState::default(),
+                covers: CoverCache::default(),
+                pending_cover: None,
+                cover_tx,
+                cover_rx,
             }
             .run(),
         );
@@ -279,12 +359,17 @@ impl ApiServer {
         Ok(ApiServer { cmd_tx, task })
     }
 
-    /// Hands the current [`Spirc`] to the server task.
+    /// Hands the current [`Spirc`] and [`Session`] to the server task.
     ///
-    /// Called on every (re)connect, as each session gets its own `Spirc`.
-    pub fn set_spirc(&self, spirc: Spirc) {
-        if self.cmd_tx.send(ApiServerCommand::SetSpirc(spirc)).is_err() {
-            warn!("could not hand the spirc to the API server: task is not running");
+    /// Called on every (re)connect, as each connection gets its own of both. They travel together
+    /// so that the two can never end up belonging to different connections.
+    pub fn set_session(&self, spirc: Spirc, session: Session) {
+        if self
+            .cmd_tx
+            .send(ApiServerCommand::SetSession { spirc, session })
+            .is_err()
+        {
+            warn!("could not hand the session to the API server: task is not running");
         }
     }
 
@@ -340,10 +425,16 @@ pub struct TrackResponse {
     album_artists: Vec<String>,
     duration_ms: u32,
     is_explicit: bool,
-    /// The largest available cover, for clients that just want one image.
-    cover_url: String,
-    /// All covers of the album / single (episode cover for podcasts), largest first.
-    covers: Vec<CoverResponse>,
+    /// The cover, base64. The urls Spotify offers are deliberately not reported: clients here
+    /// cannot reach the internet, so a url would be something they can only fail to follow.
+    /// Empty when there is no cover to be had — see [`cover_to_ship`].
+    cover_data: String,
+    /// The media type of `cover_data`, empty along with it.
+    cover_mime: String,
+    /// The dimensions of `cover_data`, zero along with it. See [`COVER_MIN_WIDTH`] for which of
+    /// the covers on offer gets shipped.
+    cover_width: i32,
+    cover_height: i32,
 }
 
 impl From<AudioItem> for TrackResponse {
@@ -383,14 +474,6 @@ impl From<AudioItem> for TrackResponse {
             String::new()
         };
 
-        // covers arrive sorted largest first
-        let covers: Vec<CoverResponse> =
-            audio_item.covers.iter().map(CoverResponse::from).collect();
-        let cover_url = covers
-            .first()
-            .map(|cover| cover.url.clone())
-            .unwrap_or_default();
-
         Self {
             song_name: audio_item.name,
             song_id,
@@ -401,31 +484,136 @@ impl From<AudioItem> for TrackResponse {
             album_artists,
             duration_ms: audio_item.duration_ms,
             is_explicit: audio_item.is_explicit,
-            cover_url,
-            covers,
+            // filled in once the bytes are there, which is what the track event waits for
+            cover_data: String::new(),
+            cover_mime: String::new(),
+            cover_width: 0,
+            cover_height: 0,
         }
     }
 }
 
-#[derive(Debug, Serialize)]
-struct CoverResponse {
+/// The cover whose bytes get shipped, out of what a track offers, largest first.
+///
+/// The smallest one that is still big enough for what clients display, so that neither the
+/// datagram nor the network carries more pixels than anyone looks at. Nothing at all when
+/// everything on offer is smaller than that: a picture too small to display is not worth the
+/// bytes, and no cover is a case clients have to handle anyway.
+fn cover_to_ship(covers: &[CoverImage]) -> Option<&CoverImage> {
+    covers
+        .iter()
+        .rev()
+        .find(|cover| cover.width >= COVER_MIN_WIDTH)
+}
+
+/// What the bytes actually are, since the url doesn't say and clients hand them to an image
+/// decoder. Spotify serves JPEG, but saying so on the strength of the magic number is cheap.
+fn cover_mime(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0xff, 0xd8, 0xff, ..] => "image/jpeg",
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Fetches a cover and hands it back to the server task.
+///
+/// Runs off the task's loop, which has to keep answering commands meanwhile. Always reports back,
+/// including when it failed, since a track event is waiting on it.
+async fn fetch_cover(session: Session, url: String, cover_tx: mpsc::UnboundedSender<CoverFetched>) {
+    let cover = match timeout(COVER_FETCH_TIMEOUT, session.spclient().request_url(&url)).await {
+        Ok(Ok(bytes)) if bytes.len() > MAX_COVER_BYTES => {
+            warn!(
+                "cover {url} is {} bytes, too big to put in a datagram",
+                bytes.len()
+            );
+            None
+        }
+        Ok(Ok(bytes)) => {
+            debug!("fetched {} bytes of cover from {url}", bytes.len());
+
+            Some(Cover {
+                mime: cover_mime(&bytes),
+                data: BASE64.encode(&bytes),
+            })
+        }
+        Ok(Err(e)) => {
+            warn!("could not fetch the cover {url}: {e}");
+            None
+        }
+        Err(_) => {
+            warn!("fetching the cover {url} timed out");
+            None
+        }
+    };
+
+    // the receiver lives as long as the server task, which is what spawned this
+    let _ = cover_tx.send(CoverFetched { url, cover });
+}
+
+/// The last few covers, so that skipping back and forth doesn't refetch them.
+///
+/// Bounded by [`COVER_CACHE_SIZE`] entries of at most [`MAX_COVER_BYTES`] each, evicted oldest
+/// first — enough for going back and forth over a couple of tracks, small enough to not matter on
+/// a Pi.
+#[derive(Debug, Default)]
+struct CoverCache {
+    covers: HashMap<String, Cover>,
+    /// Insertion order, for eviction.
+    order: VecDeque<String>,
+}
+
+impl CoverCache {
+    fn get(&self, url: &str) -> Option<&Cover> {
+        self.covers.get(url)
+    }
+
+    fn insert(&mut self, url: String, cover: Cover) {
+        if self.covers.contains_key(&url) {
+            return;
+        }
+
+        if self.order.len() >= COVER_CACHE_SIZE {
+            if let Some(oldest) = self.order.pop_front() {
+                self.covers.remove(&oldest);
+            }
+        }
+
+        self.order.push_back(url.clone());
+        self.covers.insert(url, cover);
+    }
+}
+
+/// The cover a track is to go out with: where to get it, and how big it is.
+///
+/// Picked off the [`AudioItem`] before it is turned into a [`TrackResponse`], which keeps no urls.
+#[derive(Debug, Clone)]
+struct WantedCover {
     url: String,
-    /// `default`, `small`, `large` or `xlarge`
-    size: &'static str,
     width: i32,
     height: i32,
 }
 
-impl From<&CoverImage> for CoverResponse {
+impl From<&CoverImage> for WantedCover {
     fn from(cover: &CoverImage) -> Self {
         Self {
             url: cover.url.clone(),
-            size: match cover.size {
-                ImageSize::DEFAULT => "default",
-                ImageSize::SMALL => "small",
-                ImageSize::LARGE => "large",
-                ImageSize::XLARGE => "xlarge",
-            },
             width: cover.width,
             height: cover.height,
         }
@@ -496,6 +684,8 @@ struct ApiServerTask {
     socket: UdpSocket,
     allow_list: AllowList,
     spirc: Option<Spirc>,
+    /// What covers are fetched with. `None` until the first connect.
+    session: Option<Session>,
     cmd_rx: mpsc::UnboundedReceiver<ApiServerCommand>,
     player_events: PlayerEventChannel,
     /// Subscribed clients and when their lease runs out.
@@ -503,6 +693,12 @@ struct ApiServerTask {
     current_track: TrackResponse,
     current_volume: VolumeResponse,
     playback: PlaybackState,
+    covers: CoverCache,
+    /// The cover the current track is waiting for, if any. Its `track_changed` goes out once that
+    /// fetch reports back, so that the event carries the picture with it.
+    pending_cover: Option<WantedCover>,
+    cover_tx: mpsc::UnboundedSender<CoverFetched>,
+    cover_rx: mpsc::UnboundedReceiver<CoverFetched>,
 }
 
 impl ApiServerTask {
@@ -514,13 +710,16 @@ impl ApiServerTask {
         loop {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => match cmd {
-                    Some(ApiServerCommand::SetSpirc(spirc)) => {
-                        debug!("API server got a new spirc handle");
+                    Some(ApiServerCommand::SetSession { spirc, session }) => {
+                        debug!("API server got a new session");
                         self.spirc = Some(spirc);
+                        self.session = Some(session);
                     }
                     // the handle was dropped or shut down
                     None => break,
                 },
+                // this task holds the sender, so the channel cannot close under it
+                Some(fetched) = self.cover_rx.recv() => self.handle_cover(fetched).await,
                 event = self.player_events.recv(), if player_events_open => match event {
                     Some(event) => self.handle_player_event(event).await,
                     None => {
@@ -543,12 +742,12 @@ impl ApiServerTask {
         match event {
             PlayerEvent::TrackChanged { audio_item } => {
                 debug!("changing currently played song to {}", audio_item.name);
-                self.current_track = TrackResponse::from(*audio_item);
 
-                self.broadcast(encode(&Event::TrackChanged {
-                    track: &self.current_track,
-                }))
-                .await;
+                // the response keeps no urls, so pick the cover before converting
+                let wanted = cover_to_ship(&audio_item.covers).map(WantedCover::from);
+
+                self.current_track = TrackResponse::from(*audio_item);
+                self.load_cover(wanted).await;
             }
             PlayerEvent::Playing { position_ms, .. } => {
                 self.update_playback(Some(true), position_ms).await
@@ -570,6 +769,72 @@ impl ApiServerTask {
             }
             _ => (),
         }
+    }
+
+    /// Puts the cover of the current track on it, and announces the track.
+    ///
+    /// When the bytes have to be fetched, the announcement waits for them, so that clients get the
+    /// track and its picture in one event. The fetch itself runs off the loop, which has to stay
+    /// responsive meanwhile, and always reports back — so the event goes out either way.
+    async fn load_cover(&mut self, wanted: Option<WantedCover>) {
+        self.pending_cover = None;
+
+        if let Some(wanted) = wanted {
+            if let Some(cover) = self.covers.get(&wanted.url).cloned() {
+                self.attach_cover(&cover, &wanted);
+            } else if let Some(session) = self.session.clone() {
+                tokio::spawn(fetch_cover(
+                    session,
+                    wanted.url.clone(),
+                    self.cover_tx.clone(),
+                ));
+                self.pending_cover = Some(wanted);
+
+                return;
+            } else {
+                // before the first connect there is nothing to fetch with
+                debug!("no session to fetch the cover with yet");
+            }
+        }
+
+        self.announce_track().await;
+    }
+
+    /// Takes a fetched cover, and announces the track that was waiting for it.
+    async fn handle_cover(&mut self, fetched: CoverFetched) {
+        // worth keeping even if nothing is waiting for it any more: whatever overtook this fetch
+        // was most likely a skip, and a skip back wants this picture again
+        if let Some(cover) = fetched.cover.clone() {
+            self.covers.insert(fetched.url.clone(), cover);
+        }
+
+        let Some(wanted) = self
+            .pending_cover
+            .take_if(|wanted| wanted.url == fetched.url)
+        else {
+            // a newer track overtook this fetch, and brings its own event along
+            return;
+        };
+
+        if let Some(cover) = fetched.cover {
+            self.attach_cover(&cover, &wanted);
+        }
+
+        self.announce_track().await;
+    }
+
+    fn attach_cover(&mut self, cover: &Cover, wanted: &WantedCover) {
+        self.current_track.cover_data = cover.data.clone();
+        self.current_track.cover_mime = cover.mime.to_string();
+        self.current_track.cover_width = wanted.width;
+        self.current_track.cover_height = wanted.height;
+    }
+
+    async fn announce_track(&mut self) {
+        self.broadcast(encode(&Event::TrackChanged {
+            track: &self.current_track,
+        }))
+        .await;
     }
 
     async fn update_playback(&mut self, is_playing: Option<bool>, position_ms: u32) {
@@ -595,7 +860,7 @@ impl ApiServerTask {
 
         // subscription keepalives arrive every lease period, so they stay at `debug`;
         // everything else is a user-triggered command and is worth seeing without RUST_LOG
-        if matches!(command, "subscribe" | "unsubscribe") {
+        if matches!(command, "subscribe" | "subscribe_refresh" | "unsubscribe") {
             debug!("received '{command}' from {peer}");
         } else {
             info!("received '{command}' from {peer}");
@@ -623,16 +888,24 @@ impl ApiServerTask {
             "current_track" => self.reply(&self.current_track, peer).await,
             "status" => self.reply(&self.snapshot(), peer).await,
             "subscribe" => {
-                if self
-                    .subscribers
-                    .insert(peer, Instant::now() + SUBSCRIPTION_LEASE)
-                    .is_none()
-                {
-                    info!("{peer} subscribed to API events");
-                }
-
-                // answering with the full state makes every keepalive a re-sync
+                self.renew_lease(peer);
+                // the full state, cover included: this is what a client asks for when it needs
+                // the picture, be it on startup or because the track changed under it
                 self.reply(&self.snapshot(), peer).await;
+            }
+            "subscribe_refresh" => {
+                self.renew_lease(peer);
+
+                // the same re-sync, minus the cover the client already has — the bytes are what
+                // makes a datagram fragment, and a keepalive should not pay for them every few
+                // seconds. A client that finds `song_uri` changed asks for the whole thing.
+                let cover = std::mem::take(&mut self.current_track.cover_data);
+                let payload = encode(&self.snapshot());
+                self.current_track.cover_data = cover;
+
+                if let Some(payload) = payload {
+                    self.send(&payload, peer).await;
+                }
             }
             "unsubscribe" => {
                 if self.subscribers.remove(&peer).is_some() {
@@ -640,6 +913,17 @@ impl ApiServerTask {
                 }
             }
             other => warn!("unknown command '{other}' from {peer}"),
+        }
+    }
+
+    /// Puts a client on the push list, or keeps it there for another lease.
+    fn renew_lease(&mut self, peer: SocketAddr) {
+        if self
+            .subscribers
+            .insert(peer, Instant::now() + SUBSCRIPTION_LEASE)
+            .is_none()
+        {
+            info!("{peer} subscribed to API events");
         }
     }
 
@@ -722,10 +1006,13 @@ mod tests {
         metadata::{
             artist::{ArtistRole, ArtistWithRole, ArtistsWithRole},
             audio::AudioFiles,
+            image::ImageSize,
         },
     };
 
     const TRACK_URI: &str = "spotify:track:2WUy2Uywcj5cP0IXQagO3z";
+    /// The one the fixture ships: the smallest at least [`COVER_MIN_WIDTH`] wide.
+    const COVER_URL: &str = "https://i.scdn.co/image/default";
 
     fn artist(name: &str) -> ArtistWithRole {
         ArtistWithRole {
@@ -752,8 +1039,10 @@ mod tests {
             track_id,
             files: AudioFiles::default(),
             name: "Sun Is Shining".to_string(),
+            // as Spotify serves them: largest first
             covers: vec![
-                cover("https://i.scdn.co/image/big", ImageSize::XLARGE, 640),
+                cover("https://i.scdn.co/image/big", ImageSize::LARGE, 640),
+                cover(COVER_URL, ImageSize::DEFAULT, 300),
                 cover("https://i.scdn.co/image/small", ImageSize::SMALL, 64),
             ],
             language: vec!["en".to_string()],
@@ -766,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn track_response_reports_artists_album_and_covers() {
+    fn track_response_reports_artists_and_album() {
         let response = TrackResponse::from(audio_item(UniqueFields::Track {
             artists: ArtistsWithRole(vec![artist("Bob Marley"), artist("The Wailers")]),
             album: "Kaya".to_string(),
@@ -789,11 +1078,69 @@ mod tests {
         assert_eq!(json["duration_ms"], 213_000);
         assert_eq!(json["is_explicit"], false);
 
-        // the largest cover is the one clients get as `cover_url`
-        assert_eq!(json["cover_url"], "https://i.scdn.co/image/big");
-        assert_eq!(json["covers"][0]["size"], "xlarge");
-        assert_eq!(json["covers"][0]["width"], 640);
-        assert_eq!(json["covers"][1]["size"], "small");
+        // no urls: what a client cannot reach is not worth reporting
+        assert!(json.get("cover_url").is_none());
+        assert!(json.get("covers").is_none());
+    }
+
+    #[test]
+    fn the_shipped_cover_is_the_smallest_one_big_enough() {
+        let covers = |edges: &[i32]| -> Vec<CoverImage> {
+            edges
+                .iter()
+                .map(|edge| cover("https://i.scdn.co/image/x", ImageSize::DEFAULT, *edge))
+                .collect()
+        };
+
+        // covers arrive largest first, and 300 is the smallest that still covers 200px of display
+        let big_enough = covers(&[640, 300, 64]);
+        assert_eq!(cover_to_ship(&big_enough).expect("picks one").width, 300);
+
+        // exactly the wanted width is big enough
+        let exact = covers(&[640, 200]);
+        assert_eq!(cover_to_ship(&exact).expect("picks one").width, 200);
+
+        // nothing worth shipping when everything on offer is too small to display
+        let all_small = covers(&[64, 32]);
+        assert!(cover_to_ship(&all_small).is_none());
+
+        assert!(cover_to_ship(&[]).is_none());
+    }
+
+    #[test]
+    fn cover_mime_follows_the_bytes() {
+        assert_eq!(cover_mime(&[0xff, 0xd8, 0xff, 0xe0, 0x00]), "image/jpeg");
+        assert_eq!(cover_mime(b"\x89PNG\r\n\x1a\n"), "image/png");
+        assert_eq!(cover_mime(b"GIF89a"), "image/gif");
+        assert_eq!(cover_mime(b"RIFF\0\0\0\0WEBPVP8 "), "image/webp");
+        // an image decoder still gets the bytes, it just isn't told what they are
+        assert_eq!(cover_mime(b"nonsense"), "application/octet-stream");
+        assert_eq!(cover_mime(&[]), "application/octet-stream");
+    }
+
+    #[test]
+    fn the_cover_cache_evicts_the_oldest() {
+        let mut cache = CoverCache::default();
+
+        for i in 0..COVER_CACHE_SIZE + 1 {
+            cache.insert(
+                format!("url-{i}"),
+                Cover {
+                    data: i.to_string(),
+                    mime: "image/jpeg",
+                },
+            );
+        }
+
+        assert!(cache.get("url-0").is_none(), "the oldest should be gone");
+        assert_eq!(
+            cache
+                .get(&format!("url-{COVER_CACHE_SIZE}"))
+                .expect("kept")
+                .data,
+            COVER_CACHE_SIZE.to_string()
+        );
+        assert_eq!(cache.covers.len(), COVER_CACHE_SIZE);
     }
 
     #[test]
@@ -823,8 +1170,10 @@ mod tests {
             "album_artists",
             "duration_ms",
             "is_explicit",
-            "cover_url",
-            "covers",
+            "cover_data",
+            "cover_mime",
+            "cover_width",
+            "cover_height",
         ] {
             assert!(json.get(field).is_some(), "missing field {field}");
         }
@@ -966,17 +1315,23 @@ mod tests {
     ) {
         let (events, player_events) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cover_tx, cover_rx) = mpsc::unbounded_channel();
 
         let task = ApiServerTask {
             socket: UdpSocket::bind("127.0.0.1:0").await.expect("binds"),
             allow_list,
             spirc: None,
+            session: None,
             cmd_rx,
             player_events,
             subscribers: HashMap::new(),
             current_track: TrackResponse::default(),
             current_volume: VolumeResponse::default(),
             playback: PlaybackState::default(),
+            covers: CoverCache::default(),
+            pending_cover: None,
+            cover_tx,
+            cover_rx,
         };
 
         (task, events, cmd_tx)
@@ -984,7 +1339,17 @@ mod tests {
 
     impl TestServer {
         async fn start(allow_list: AllowList) -> Self {
-            let (task, events, cmd_tx) = idle_task(allow_list).await;
+            Self::start_with(allow_list, |_| ()).await
+        }
+
+        /// Starts a server whose state a test got to set up first — there is no session to fetch
+        /// anything with here, so a seeded cover cache stands in for the network.
+        async fn start_with(
+            allow_list: AllowList,
+            prepare: impl FnOnce(&mut ApiServerTask),
+        ) -> Self {
+            let (mut task, events, cmd_tx) = idle_task(allow_list).await;
+            prepare(&mut task);
             let addr = task.socket.local_addr().expect("has an address");
 
             tokio::spawn(task.run());
@@ -1005,7 +1370,8 @@ mod tests {
         }
 
         async fn receive(&self) -> serde_json::Value {
-            let mut buf = [0u8; MAX_DATAGRAM_SIZE * 8];
+            // what a real client needs: enough for a track event carrying a cover
+            let mut buf = vec![0u8; MAX_COVER_BYTES * 2];
 
             let (len, _) =
                 tokio::time::timeout(Duration::from_secs(2), self.client.recv_from(&mut buf))
@@ -1059,6 +1425,8 @@ mod tests {
         let event = server.receive().await;
         assert_eq!(event["event"], "track_changed");
         assert_eq!(event["track"]["song_name"], "Sun Is Shining");
+        // there is no session here to fetch a cover with, so the event goes out without one
+        assert_eq!(event["track"]["cover_data"], "");
 
         server.request("unsubscribe").await;
         // the answer to this proves the unsubscribe was handled before the event below
@@ -1073,6 +1441,109 @@ mod tests {
         assert!(
             server.receives_nothing().await,
             "an unsubscribed client should not be pushed to"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_track_event_carries_the_cover_bytes() {
+        const JPEG: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03];
+
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            task.covers.insert(
+                COVER_URL.to_string(),
+                Cover {
+                    data: BASE64.encode(JPEG),
+                    mime: "image/jpeg",
+                },
+            );
+        })
+        .await;
+
+        server.request("subscribe").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
+
+        server
+            .events
+            .send(PlayerEvent::TrackChanged {
+                audio_item: Box::new(audio_item(UniqueFields::Track {
+                    artists: ArtistsWithRole(vec![artist("Bob Marley")]),
+                    album: "Kaya".to_string(),
+                    album_artists: Vec::new(),
+                    popularity: 42,
+                    number: 3,
+                    disc_number: 1,
+                })),
+            })
+            .expect("the task is running");
+
+        let event = server.receive().await;
+        assert_eq!(event["event"], "track_changed");
+
+        let track = &event["track"];
+        assert_eq!(track["cover_data"], BASE64.encode(JPEG));
+        assert_eq!(track["cover_mime"], "image/jpeg");
+        // the 300px one, not the 640px the fixture also offers
+        assert_eq!(track["cover_width"], 300);
+        assert_eq!(track["cover_height"], 300);
+
+        // and a client that polls instead of subscribing gets the same picture
+        server.request("current_track").await;
+        assert_eq!(server.receive().await["cover_data"], BASE64.encode(JPEG));
+    }
+
+    #[tokio::test]
+    async fn a_keepalive_re_syncs_without_resending_the_cover() {
+        const JPEG: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03];
+
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            task.covers.insert(
+                COVER_URL.to_string(),
+                Cover {
+                    data: BASE64.encode(JPEG),
+                    mime: "image/jpeg",
+                },
+            );
+        })
+        .await;
+
+        // a keepalive subscribes a client that isn't on the list yet, so a lost lease is not fatal
+        server.request("subscribe_refresh").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
+
+        server
+            .events
+            .send(PlayerEvent::TrackChanged {
+                audio_item: Box::new(audio_item(UniqueFields::Track {
+                    artists: ArtistsWithRole(vec![artist("Bob Marley")]),
+                    album: "Kaya".to_string(),
+                    album_artists: Vec::new(),
+                    popularity: 42,
+                    number: 3,
+                    disc_number: 1,
+                })),
+            })
+            .expect("the task is running");
+
+        // proving it was subscribed: the track event arrives, with the cover
+        let event = server.receive().await;
+        assert_eq!(event["event"], "track_changed");
+        assert_eq!(event["track"]["cover_data"], BASE64.encode(JPEG));
+
+        server.request("subscribe_refresh").await;
+        let snapshot = server.receive().await;
+
+        // the state is re-synced in full, so a client can tell whether its picture is still current
+        assert_eq!(snapshot["event"], "snapshot");
+        assert_eq!(snapshot["track"]["song_name"], "Sun Is Shining");
+        assert_eq!(snapshot["track"]["song_uri"], TRACK_URI);
+        // but the bytes are left out, which is the whole point of the keepalive
+        assert_eq!(snapshot["track"]["cover_data"], "");
+
+        // and holding them back does not lose them: `subscribe` still hands over the picture
+        server.request("subscribe").await;
+        assert_eq!(
+            server.receive().await["track"]["cover_data"],
+            BASE64.encode(JPEG)
         );
     }
 
