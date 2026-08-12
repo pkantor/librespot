@@ -9,6 +9,16 @@ Current maintainers are [listed on GitHub](https://github.com/orgs/librespot-org
 
 _Note: librespot only works with Spotify Premium. This will remain the case. We will not support any features to make librespot compatible with free accounts, such as limited skips and adverts._
 
+# What this fork adds
+
+This is a fork of [librespot-org/librespot](https://github.com/librespot-org/librespot), on the `API` branch. Everything upstream does, it still does. Two things it adds:
+
+**AirPlay receiver, with remote control.** The same binary is also an AirPlay speaker, advertised under the same device name (`-n`) as the Spotify Connect one, playing through the same audio backend. It is on by default; `--disable-airplay` turns it off. Control works in both directions: a phone streaming to it can be paused, resumed, skipped and turned up *from this device*, over DACP. That is why the receiver presents itself as an AirPlay 1 (RAOP) device — an AirPlay 2 sender offers a receiver no control channel at all, so speaking AirPlay 1 is what makes remote control possible.
+
+**A control API of its own.** A UDP server (`--api-bind`, default `0.0.0.0:50505`) that reports what is playing and takes commands, for both sources through one interface — a client neither knows nor cares whether the music is coming from Spotify or from someone's phone. Clients can poll or subscribe for push events: track changes, play/pause, volume, and cover art fetched on request in chunks. `--api-allow` takes a CIDR allow list (unrestricted by default; loopback is always allowed). [`contrib/api_test.py`](contrib/api_test.py) is a working reference client and documents the wire format.
+
+Neither is published to crates.io — `cargo install librespot` gets you upstream. Build this one from source (see [Building](#building)); the default feature set already includes both.
+
 ## Quick start
 We're available on [crates.io](https://crates.io/crates/librespot) as the _librespot_ package. Simply run `cargo install librespot` to install librespot on your system. Check the wiki for more info and possible [usage options](https://github.com/librespot-org/librespot/wiki/Options).
 

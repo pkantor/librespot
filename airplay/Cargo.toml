@@ -1,0 +1,75 @@
+[package]
+name = "librespot-airplay"
+version = "0.8.0"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AirPlay receiver support for librespot"
+repository.workspace = true
+edition.workspace = true
+
+[dependencies]
+librespot-core = { version = "0.8.0", path = "../core", default-features = false }
+# Sink/SinkBuilder/Converter/AudioPacket/AudioFormat — see sink.rs's module docs for why this
+# crate reuses the playback pipeline's own types instead of a parallel set.
+librespot-playback = { version = "0.8.0", path = "../playback", default-features = false }
+
+# pairing / crypto (see plan §"Spike outcomes" — validated against hap-rs's own choices)
+#
+# rand_core is pinned to 0.6 (not the workspace's usual 0.9-era rand) because that's what
+# ed25519-dalek 2.x's `rand_core` feature and x25519-dalek 2.x actually depend on — their
+# `CryptoRngCore`/`RngCore` bounds are a different, incompatible trait generation from rand 0.9's.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# real-time audio decode (ALAC/AAC) — no new decoder needed, see plan Spike B
+symphonia = { version = "0.5", default-features = false, features = [
+    "alac",
+    "aac",
+] }
+
+# Classic AirPlay 1 / RAOP fallback (see legacy/mod.rs's module docs) — a real iPhone negotiates
+# this way even against an AirPlay-2-capable receiver, and shairport-sync supports it too even
+# while running in AirPlay 2 mode. `rsa`/`aes`/`cbc` versions match what `librespot-core` already
+# depends on elsewhere in this workspace (`core/Cargo.toml`), not picked independently.
+aes = "0.8"
+base64 = "0.22"
+cbc = "0.1"
+rsa = "0.9"
+sha1 = "0.10"
+
+log = "0.4"
+# libmdns (default) or dns-sd (opt-in `dns-sd` feature) — see discovery.rs's module docs for why
+# both exist: libmdns has confirmed real-device compliance gaps (no RFC 6762 cache-flush bit, no
+# message-size/truncation handling), and dns-sd — the same crate `librespot-discovery` already
+# uses for Spotify Connect's own `with-dns-sd` backend — talks to the real system daemon (Bonjour
+# on macOS, avahi's compat layer on Linux) instead of reimplementing the protocol. Opt-in rather
+# than the new default: unverified whether the avahi-compat lib is available in the Raspberry Pi
+# cross-compile image this fork's release pipeline uses (`rpi-release.yml`/`Cross.toml`), so
+# switching the default risks silently breaking that pipeline without a way to test it here.
+libmdns = "0.10"
+dns-sd = { version = "0.1", optional = true }
+# DACP remote control (see dacp.rs's module docs) needs real mDNS *query* capability (browse +
+# resolve) to find a sender's `_dacp._tcp` port — confirmed the hard way, by reading the `dns-sd`
+# crate above's full source before writing any code against it: it only binds
+# `DNSServiceRegister`, no browse/resolve at all (matches how this crate only ever uses it for
+# advertising). `libmdns` can't either (publish-only). `mdns-sd` is a different crate (confusingly
+# similar name) — actively maintained, pure Rust, genuine browse/resolve with an async-friendly
+# API.
+mdns-sd = { version = "0.21", optional = true, default-features = false, features = ["async"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros", "io-util"] }
+
+[features]
+dns-sd = ["dep:dns-sd"]
+# DACP remote control (Play/Pause/Next + now-playing polling) for the classic-RAOP path — see
+# dacp.rs's module docs. Independent of the `dns-sd` feature above (that one is about which
+# backend *advertises* this receiver's own services; this one is about *querying* for a sender's
+# DACP service, a different concern, needing a different crate). Opt-in, with no licensing
+# restriction on including it in a public release.
+remote-control = ["dep:mdns-sd"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+
+[lints]
+workspace = true

@@ -36,7 +36,16 @@ repository = "https://github.com/librespot-org/librespot"
 edition = "2024"
 
 [features]
-default = ["native-tls", "rodio-backend", "with-libmdns"]
+# `airplay-remote-control` pulls in `airplay` too (see its own docs below). Both are default in
+# this fork because the AirPlay receiver is one of the two things it exists for, and the receiver
+# without remote control is half a receiver: a client on the UDP API could see what is playing but
+# not pause it. Nothing here is GPL-encumbered any more, so a default build is a distributable one.
+default = [
+    "native-tls",
+    "rodio-backend",
+    "with-libmdns",
+    "airplay-remote-control",
+]
 
 # TLS backends (mutually exclusive - compile-time checks in oauth/src/lib.rs)
 # Note: Feature validation is in oauth crate since it's compiled first in the dependency tree.
@@ -132,6 +141,30 @@ with-dns-sd = ["librespot-discovery/with-dns-sd"]
 # data.
 passthrough-decoder = ["librespot-playback/passthrough-decoder"]
 
+# Fork-specific features:
+
+# airplay: AirPlay receiver (classic AirPlay/RAOP — see `librespot-airplay`'s own docs for why
+# that generation and not AirPlay 2), run alongside Spotify Connect and sharing the same device
+# name (-n/--name). Pulls in its own crypto/codec dependency tree.
+airplay = ["dep:librespot-airplay"]
+
+# airplay-dns-sd: switches the AirPlay receiver's mDNS advertisement from libmdns (default) to
+# the system dns-sd daemon (Bonjour on macOS, avahi's compat layer on Linux) — see
+# airplay/src/discovery.rs's module docs for why. Meaningless without `airplay` also enabled.
+airplay-dns-sd = ["librespot-airplay/dns-sd"]
+
+# airplay-remote-control: DACP-based Play/Pause/Next and now-playing polling for AirPlay's
+# classic-RAOP path, surfaced through `src/server.rs`'s existing UDP API alongside Spotify Connect
+# — see `librespot-airplay`'s own `remote-control` feature docs (airplay/Cargo.toml). Unlike
+# `airplay-dns-sd`, this one *does* force-enable `airplay`
+# (rather than just documenting the expectation) — `src/server.rs` references
+# `librespot::airplay::dacp::DacpTarget` directly, which needs the `librespot_airplay` re-export
+# that only exists under the root `airplay` feature; without this, enabling only
+# `airplay-remote-control` would pull in the `librespot-airplay` dependency (Cargo's
+# `"pkg/feature"` syntax already forces that) while leaving `librespot::airplay` itself absent —
+# a broken combination this avoids by construction instead of just documenting it.
+airplay-remote-control = ["airplay", "librespot-airplay/remote-control"]
+
 [lib]
 name = "librespot"
 path = "src/lib.rs"
@@ -142,6 +175,7 @@ path = "src/main.rs"
 doc = false
 
 [workspace.dependencies]
+librespot-airplay = { version = "0.8.0", path = "airplay", default-features = false }
 librespot-audio = { version = "0.8.0", path = "audio", default-features = false }
 librespot-connect = { version = "0.8.0", path = "connect", default-features = false }
 librespot-core = { version = "0.8.0", path = "core", default-features = false }
@@ -152,6 +186,7 @@ librespot-playback = { version = "0.8.0", path = "playback", default-features = 
 librespot-protocol = { version = "0.8.0", path = "protocol", default-features = false }
 
 [dependencies]
+librespot-airplay = { workspace = true, optional = true }
 librespot-audio.workspace = true
 librespot-connect.workspace = true
 librespot-core.workspace = true

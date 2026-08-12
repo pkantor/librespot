@@ -9,15 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- [airplay] AirPlay receiver, advertised over mDNS beside Spotify Connect and sharing the same
+  device name (`-n`/`--name`) and audio output. Plays ALAC audio from a real sender, and reports
+  what it is playing — title, artist, album, cover art and position — from the sender's own
+  metadata pushes.
+- [airplay] Remote control of the sender over DACP: `pause`, `resume` and `next` reach the phone
+  that is streaming, alongside volume in both directions.
+- [api] AirPlay is reported through the same UDP API as Spotify Connect, in the same shape: a
+  `source` field (`"spotify"` or `"airplay"`) says which is playing, and `pause`/`resume`/`next`
+  are routed to whichever source last played — including after it stopped, so `resume` reaches
+  the phone that was streaming rather than an idle Spotify session.
+- [api] `cover` command, answering with the current cover art split across as many `cover_chunk`
+  datagrams as it takes, and a `cover_available` event announcing that there is one to ask for.
 - [connect] Add method `add_to_queue` to `Spirc` to add tracks, episodes, albums and playlists to the queue
 - [playback] Add `SetQueue` player event, emitting when the queue changes (context loaded, track added to queue, or queue set via Spotify Connect). Gated behind `ConnectConfig::emit_set_queue_events`
 
 ### Changed
 
+- [airplay] The receiver now presents itself as an AirPlay 1 (RAOP) device rather than an
+  AirPlay 2 one. This is what makes remote control possible at all: an AirPlay 2 sender never
+  offers a control channel a receiver can use — an unsolved problem across every open
+  implementation, shairport-sync included — while a classic sender does. (breaking)
+- [airplay] Removed the FairPlay 3 key unwrapping used by the AirPlay 2 path. A classic sender
+  wraps the audio key with RSA instead, which needs no such code, and the GPLv2-derived
+  implementation it required is gone with it — this tree is MIT throughout. (breaking)
+- [main] The AirPlay receiver runs by default; `--airplay` is replaced by `--disable-airplay`.
+  (breaking)
+- [main] Removed `--airplay-pairing-store`: there is no pairing to persist on the classic path,
+  and the receiver's identity is now derived from its name, so it is stable across restarts with
+  nothing stored. (breaking)
+- [main] `airplay-remote-control` is a default feature.
+- [api] Removed `subscribe_refresh`. It existed only to renew a lease without dragging the cover
+  along; with covers out of every response there is nothing cheaper to send, so renewing is
+  `subscribe` again — which registers a client that isn't subscribed just as it always did.
+  (breaking)
+- [api] Cover art no longer travels in `current_track`, `status` or any event: the `cover_data`,
+  `cover_mime`, `cover_width` and `cover_height` fields are gone, and a client asks for the
+  picture with `cover` instead. Carrying one made those responses larger than a datagram can be
+  sent as (`Message too long`), which lost the whole response rather than just the picture.
+  Freed of that limit, the cover fetched from Spotify is now the largest on offer rather than the
+  smallest one big enough to display, and a sender's own artwork is kept whole. (breaking)
 - [core] Made `SpotifyId::to_base62`, `SpotifyId::to_base16`, `FileId::to_base16`, `SpotifyUri::to_id`, `SpotifyUri::to_uri` infallible (breaking)
 
 ### Fixed
 
+- [api] A source that goes away no longer leaves its last track on display: the reported track,
+  cover and position are cleared when a Spotify Connect session disconnects or an AirPlay session
+  ends, whichever of the two was the one playing. A client had no way to tell a finished session's
+  leftovers from something still playing.
 - [audio] Fixed integer overflow in throughput calculation
 - [main] Fixed `--volume-ctrl fixed` not disabling volume control
 - [core] Fix default permissions on credentials file and warn user if file is world readable

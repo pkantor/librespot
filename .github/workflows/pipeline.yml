@@ -24,8 +24,9 @@ concurrency:
 
 env:
   RUST_BACKTRACE: 1
-  # what the Pi runs — see rpi-release.yml
-  SHIPPED_FEATURES: rustls-tls-native-roots,alsa-backend,with-libmdns
+  # what the Pi runs — keep in step with `RPI_FEATURES` in rpi-release.yml, or this job stops
+  # checking the thing it exists to check
+  SHIPPED_FEATURES: rustls-tls-native-roots,alsa-backend,with-libmdns,airplay-remote-control
 
 jobs:
   # quality and test run in parallel: both compile the workspace, so serializing them would

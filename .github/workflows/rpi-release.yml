@@ -23,7 +23,11 @@ env:
   # rustls instead of native-tls: the cross image links against an OpenSSL the Pi does not have.
   # This leaves glibc and libasound.so.2 as the only shared dependencies.
   # Comma-separated so it survives whatever tokenization the build action applies to `args`.
-  RPI_FEATURES: rustls-tls-native-roots,alsa-backend,with-libmdns
+  # `airplay-remote-control` force-enables `airplay`, so naming it here brings in the receiver
+  # too. Nothing in this feature set is GPL-licensed, and nothing added here may be: this
+  # workflow publishes the binary on GitHub Releases, which a GPLv2 component would make a
+  # derivative work of.
+  RPI_FEATURES: rustls-tls-native-roots,alsa-backend,with-libmdns,airplay-remote-control
 
 jobs:
   build:

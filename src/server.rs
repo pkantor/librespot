@@ -18,7 +18,7 @@
 //! | `current_track`     | -                   | [`TrackResponse`] as JSON       |
 //! | `status`            | -                   | `snapshot` event as JSON        |
 //! | `subscribe`         | -                   | `snapshot` event as JSON        |
-//! | `subscribe_refresh` | -                   | `snapshot` without cover bytes  |
+//! | `cover`             | -                   | `cover_chunk` events as JSON    |
 //! | `unsubscribe`       | -                   | -                               |
 //!
 //! # Push events
@@ -29,18 +29,10 @@
 //! keepalive interval instead of indefinitely. A client that goes away silently is dropped when
 //! its lease runs out; `unsubscribe` deregisters it right away.
 //!
-//! `subscribe_refresh` is the keepalive to renew with. It answers with the same `snapshot`, minus
-//! the cover bytes the client already has, which is what keeps a keepalive down to one small
-//! datagram instead of a fragmented one — see the cover section below. It registers a sender that
-//! isn't subscribed yet just as `subscribe` would, so a client can lose its lease and keep going.
-//!
-//! A client therefore subscribes once, renews with `subscribe_refresh`, and takes the cover from
-//! the `track_changed` it gets pushed. The one case that leaves it without a picture is a lost
-//! `track_changed` — the only event carrying a cover, and so the only one that travels
-//! fragmented — after which a keepalive reports a `song_uri` the client has no cover for. The rule
-//! that repairs it, and startup, and a client that dropped its cache, is: **ask `current_track`
-//! whenever you don't have the cover for the `song_uri` last reported**. The server keeps no
-//! record of who has what.
+//! Renewing is just `subscribe` again: it registers a sender that isn't subscribed yet and
+//! refreshes one that is, so a client that lost its lease keeps going without noticing, and every
+//! keepalive doubles as a re-sync. There is nothing cheaper to send instead, since no response
+//! carries a picture any more.
 //!
 //! Events are JSON datagrams discriminated by their `event` field:
 //!
@@ -49,6 +41,8 @@
 //! {"event":"track_changed","track":{…}}
 //! {"event":"playback_changed","is_playing":false,"position_ms":41200}
 //! {"event":"volume_changed","volume":32768}
+//! {"event":"cover_available","mime":"image/jpeg","bytes":184320}
+//! {"event":"cover_chunk","mime":"image/jpeg","index":0,"count":60,"data":"…"}
 //! ```
 //!
 //! `position_ms` is always valid at the moment the datagram is sent, so a client extrapolates it
@@ -57,32 +51,32 @@
 //!
 //! # Cover art
 //!
-//! A track carries its cover as bytes (`cover_data`, base64) and by no other means: the clients
-//! here cannot reach the internet, so the urls Spotify offers are not reported at all — only the
-//! Pi ever follows one. The picture is fetched once per track no matter how many clients are
-//! listening, and the last few are cached, so skipping back and forth doesn't refetch.
+//! Covers travel **only** in answer to the `cover` command, never in a track event or any other
+//! response. A picture is a hundred times the size of everything else here — a real AirPlay
+//! sender pushes ~180 kB, which base64 turns into 240 kB — and carrying one in a track event
+//! meant the event exceeded what a datagram can hold: the send fails outright (`Message too
+//! long`) and the client sees nothing at all. So every response is small now, and a client that
+//! wants a picture asks for one.
 //!
-//! `cover_data` is empty whenever there is no picture to be had — nothing on offer big enough to
-//! display, a failed or slow fetch, no session yet. That is a case clients have to handle anyway,
-//! so no effort is spent on second-best substitutes.
+//! `cover` answers with as many `cover_chunk` datagrams as it takes, each carrying
+//! [`COVER_CHUNK_BYTES`] of the picture, its own `index` and the `count` — enough to reassemble
+//! them and to notice a lost one. A track with no cover is answered with a single `count: 0`,
+//! which is an answer rather than silence. Nothing is retransmitted: a client that misses a chunk
+//! asks again.
 //!
-//! That makes any datagram carrying a track a few tens of kB, well past the MTU, so it travels as
-//! a fragmented datagram rather than a single packet. Two things follow for clients:
+//! Because the picture no longer rides along with anything, its size stopped being a design
+//! constraint. Spotify's *largest* cover is fetched rather than the smallest one big enough to
+//! display, and a sender's own artwork is kept whole. `cover_available` tells subscribers a
+//! picture can be asked for, so nobody has to poll.
 //!
-//! - the receive buffer has to be at least [`MAX_COVER_BYTES`] plus change; 128 kB is a safe size.
-//!   Note that a short buffer is not merely truncating on Windows: `recvfrom` fails with
-//!   `WSAEMSGSIZE` and drops the datagram whole,
-//! - the kernel reassembles the fragments, so a client still reads one whole event in one `recv`,
-//!   or nothing at all — but losing any single fragment loses the whole event, which the keepalive
-//!   repairs at the next lease at the latest.
+//! Urls are still not reported at all: the clients here cannot reach the internet, only the Pi
+//! can. A cover is fetched once per track no matter how many clients are listening, and the last
+//! few are cached, so skipping back and forth doesn't refetch.
 //!
-//! Only the datagrams that actually carry a cover are that big, which is why the keepalive is
-//! `subscribe_refresh` rather than `subscribe`: a client re-syncs every few seconds, but it only
-//! takes the fragmented path when the track changed under it.
-//!
-//! On Linux — what this runs on — a datagram may be up to 65507 bytes, comfortably more than a
-//! cover needs. macOS caps outgoing datagrams at `net.inet.udp.maxdgram`, 9216 by default, so a
-//! server run there fails to send covers until that sysctl is raised.
+//! With no datagram exceeding a few kilobytes, none of this depends on IP fragmentation any more,
+//! and a modest receive buffer is enough — 64 kB is plenty. The platform difference that used to
+//! matter (macOS caps outgoing datagrams at `net.inet.udp.maxdgram`, 9216 by default, while Linux
+//! allows 65507) no longer affects anything this server sends.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -93,6 +87,10 @@ use std::{
 };
 
 use data_encoding::BASE64;
+#[cfg(feature = "airplay-remote-control")]
+use librespot::airplay::dacp::DacpTarget;
+#[cfg(feature = "airplay")]
+use librespot::airplay::{AirplayControl, AirplayEvent};
 use librespot::{
     connect::Spirc,
     core::{Error, Session},
@@ -115,15 +113,15 @@ pub const SUBSCRIPTION_LEASE: Duration = Duration::from_secs(30);
 /// payload. Answers are not bound by this — one carrying a cover runs to tens of kB.
 const MAX_DATAGRAM_SIZE: usize = 1024;
 
-/// The cover that gets shipped is the smallest one Spotify offers that is still at least this
-/// wide. Clients scale down for display, which keeps the Pi out of the business of decoding and
-/// resizing pictures, and keeps the datagram down to what anyone actually looks at.
-const COVER_MIN_WIDTH: i32 = 200;
+/// Raw bytes per `cover` chunk. Base64 grows this by a third, so a chunk plus its JSON envelope
+/// stays comfortably inside a small datagram — well under the 9216-byte cap macOS puts on one
+/// (`net.inet.udp.maxdgram`) and nowhere near needing IP fragmentation on any platform.
+const COVER_CHUNK_BYTES: usize = 3 * 1024;
 
-/// Covers bigger than this are dropped, and the track goes out without one. A picture this size is
-/// far past what [`COVER_MIN_WIDTH`] asks for, so hitting this means something is off — and it is
-/// more fragments to lose than a cover is worth.
-pub const MAX_COVER_BYTES: usize = 64 * 1024;
+/// A cover past this is refused rather than sent. Nothing legitimate approaches it — a sender's
+/// own artwork runs to a couple of hundred kilobytes — so this is a bound on damage, not a
+/// quality decision.
+pub const MAX_COVER_BYTES: usize = 2 * 1024 * 1024;
 
 /// How long a cover fetch may take before the track event goes out without it.
 const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -283,7 +281,17 @@ fn prefix_matches(network: &[u8], addr: &[u8], prefix_len: u8) -> bool {
 }
 
 enum ApiServerCommand {
-    SetSession { spirc: Spirc, session: Session },
+    SetSession {
+        spirc: Spirc,
+        session: Session,
+    },
+    /// Hands over a running `AirplayServer`'s event stream — see `ApiServer::set_airplay_events`.
+    /// A second call just replaces the first receiver.
+    #[cfg(feature = "airplay")]
+    SetAirplay {
+        events: mpsc::UnboundedReceiver<AirplayEvent>,
+        control: AirplayControl,
+    },
 }
 
 /// A cover fetched off the loop, on its way back to the task that asked for it.
@@ -294,11 +302,11 @@ struct CoverFetched {
     cover: Option<Cover>,
 }
 
-/// Cover bytes, ready to go into a datagram.
+/// A cover as it is held and sent: raw bytes, base64-encoded one chunk at a time by the `cover`
+/// command rather than all at once.
 #[derive(Debug, Clone)]
 struct Cover {
-    /// Base64, since the wire format is JSON.
-    data: String,
+    bytes: Vec<u8>,
     mime: &'static str,
 }
 
@@ -349,9 +357,19 @@ impl ApiServer {
                 current_volume: VolumeResponse::default(),
                 playback: PlaybackState::default(),
                 covers: CoverCache::default(),
-                pending_cover: None,
+                current_cover: None,
                 cover_tx,
                 cover_rx,
+                #[cfg(feature = "airplay")]
+                airplay_events: None,
+                #[cfg(feature = "airplay")]
+                active_source: Source::default(),
+                #[cfg(feature = "airplay-remote-control")]
+                airplay_dacp: None,
+                #[cfg(feature = "airplay")]
+                airplay_connection: None,
+                #[cfg(feature = "airplay")]
+                airplay_control: None,
             }
             .run(),
         );
@@ -370,6 +388,25 @@ impl ApiServer {
             .is_err()
         {
             warn!("could not hand the session to the API server: task is not running");
+        }
+    }
+
+    /// Hands over an `AirplayServer`'s event receiver, so AirPlay's now-playing info and control
+    /// fold into the same state and events Spotify Connect already reports here. Called from
+    /// `main.rs` once both servers exist; not called at all when AirPlay isn't running, which is
+    /// why it isn't a `spawn` argument.
+    #[cfg(feature = "airplay")]
+    pub fn set_airplay_events(
+        &self,
+        events: mpsc::UnboundedReceiver<AirplayEvent>,
+        control: AirplayControl,
+    ) {
+        if self
+            .cmd_tx
+            .send(ApiServerCommand::SetAirplay { events, control })
+            .is_err()
+        {
+            warn!("could not hand AirPlay events to the API server: task is not running");
         }
     }
 
@@ -406,6 +443,20 @@ enum Event<'a> {
     VolumeChanged {
         volume: u16,
     },
+    /// A cover for the current track is now held and can be asked for with `cover`. Carries the
+    /// size so a client can decide whether it wants it, not the picture itself.
+    CoverAvailable {
+        mime: &'static str,
+        bytes: usize,
+    },
+    /// One chunk of an answer to `cover`, `index` of `count`. `count: 0` means there is no cover
+    /// for the current track.
+    CoverChunk {
+        mime: &'a str,
+        index: usize,
+        count: usize,
+        data: String,
+    },
 }
 
 /// Answer to `current_track`.
@@ -427,14 +478,10 @@ pub struct TrackResponse {
     is_explicit: bool,
     /// The cover, base64. The urls Spotify offers are deliberately not reported: clients here
     /// cannot reach the internet, so a url would be something they can only fail to follow.
-    /// Empty when there is no cover to be had — see [`cover_to_ship`].
-    cover_data: String,
-    /// The media type of `cover_data`, empty along with it.
-    cover_mime: String,
-    /// The dimensions of `cover_data`, zero along with it. See [`COVER_MIN_WIDTH`] for which of
-    /// the covers on offer gets shipped.
-    cover_width: i32,
-    cover_height: i32,
+    /// `"spotify"` or `"airplay"` — empty in [`TrackResponse::default`] (nothing has played yet).
+    /// Lets a client tell the two sources apart in the *same* `current_track`/`subscribe` shape,
+    /// since both write into these same fields (see `ApiServerTask::handle_airplay_event`).
+    source: String,
 }
 
 impl From<AudioItem> for TrackResponse {
@@ -485,25 +532,18 @@ impl From<AudioItem> for TrackResponse {
             duration_ms: audio_item.duration_ms,
             is_explicit: audio_item.is_explicit,
             // filled in once the bytes are there, which is what the track event waits for
-            cover_data: String::new(),
-            cover_mime: String::new(),
-            cover_width: 0,
-            cover_height: 0,
+            source: "spotify".to_string(),
         }
     }
 }
 
-/// The cover whose bytes get shipped, out of what a track offers, largest first.
+/// The cover to fetch, out of what a track offers: the largest.
 ///
-/// The smallest one that is still big enough for what clients display, so that neither the
-/// datagram nor the network carries more pixels than anyone looks at. Nothing at all when
-/// everything on offer is smaller than that: a picture too small to display is not worth the
-/// bytes, and no cover is a case clients have to handle anyway.
+/// Size stopped being a reason to compromise once covers left the track event and got their own
+/// chunked command — a client that asks for a picture wants the good one, and it costs a few
+/// datagrams more only when it asks.
 fn cover_to_ship(covers: &[CoverImage]) -> Option<&CoverImage> {
-    covers
-        .iter()
-        .rev()
-        .find(|cover| cover.width >= COVER_MIN_WIDTH)
+    covers.iter().max_by_key(|cover| cover.width)
 }
 
 /// What the bytes actually are, since the url doesn't say and clients hand them to an image
@@ -550,7 +590,7 @@ async fn fetch_cover(session: Session, url: String, cover_tx: mpsc::UnboundedSen
 
             Some(Cover {
                 mime: cover_mime(&bytes),
-                data: BASE64.encode(&bytes),
+                bytes: bytes.to_vec(),
             })
         }
         Ok(Err(e)) => {
@@ -600,26 +640,6 @@ impl CoverCache {
     }
 }
 
-/// The cover a track is to go out with: where to get it, and how big it is.
-///
-/// Picked off the [`AudioItem`] before it is turned into a [`TrackResponse`], which keeps no urls.
-#[derive(Debug, Clone)]
-struct WantedCover {
-    url: String,
-    width: i32,
-    height: i32,
-}
-
-impl From<&CoverImage> for WantedCover {
-    fn from(cover: &CoverImage) -> Self {
-        Self {
-            url: cover.url.clone(),
-            width: cover.width,
-            height: cover.height,
-        }
-    }
-}
-
 /// Answer to `getvol`.
 #[derive(Debug, Default, Serialize)]
 pub struct VolumeResponse {
@@ -629,6 +649,20 @@ pub struct VolumeResponse {
 #[derive(Debug, Deserialize)]
 struct SetVolumeRequest {
     volume: u16,
+}
+
+/// DACP's 0..=100 to the `u16` this server reports and Spotify uses, so a client sees one scale
+/// whichever source is playing. Rounded rather than truncated, so 100% is exactly `u16::MAX`
+/// instead of one short of it.
+#[cfg(feature = "airplay")]
+fn volume_from_percent(percent: u8) -> u16 {
+    (f64::from(percent.min(100)) / 100.0 * f64::from(u16::MAX)).round() as u16
+}
+
+/// The other direction, for a `setvol` that has to travel as an AirPlay percentage.
+#[cfg(feature = "airplay")]
+fn percent_from_volume(volume: u16) -> u8 {
+    (f64::from(volume) / f64::from(u16::MAX) * 100.0).round() as u8
 }
 
 /// Where playback stands, as of the last event the player sent.
@@ -696,12 +730,76 @@ struct ApiServerTask {
     covers: CoverCache,
     /// The cover the current track is waiting for, if any. Its `track_changed` goes out once that
     /// fetch reports back, so that the event carries the picture with it.
-    pending_cover: Option<WantedCover>,
+    /// The cover of whatever is playing, once there is one. Never part of a track event or any
+    /// other response — a client asks for it with `cover` and gets it in chunks.
+    current_cover: Option<Cover>,
     cover_tx: mpsc::UnboundedSender<CoverFetched>,
     cover_rx: mpsc::UnboundedReceiver<CoverFetched>,
+    /// `None` until `set_airplay_events` hands one over (or forever, if AirPlay isn't running at
+    /// all) — see `Self::run`'s `select!` for how a `None` here just never fires that branch.
+    #[cfg(feature = "airplay")]
+    airplay_events: Option<mpsc::UnboundedReceiver<AirplayEvent>>,
+    /// Which source `next`/`pause`/`resume` currently reach — see [`Source`].
+    #[cfg(feature = "airplay")]
+    active_source: Source,
+    /// Where to send a DACP command once AirPlay is the active source, and which AirPlay
+    /// connection it came from — `None` until a session's `Active-Remote`/`DACP-ID` headers have
+    /// actually resolved to a reachable DACP endpoint, and then **kept**, including after that
+    /// session ends: a sender's DACP server outlives its AirPlay session, and reaching it is what
+    /// makes `resume` able to start the music again (see the `SessionEnded` handling, and
+    /// shairport-sync's `relinquish_dacp_server_information`, which likewise never clears it).
+    /// Replaced wholesale when another connection resolves one of its own.
+    #[cfg(feature = "airplay-remote-control")]
+    airplay_dacp: Option<(u64, DacpTarget)>,
+    /// The AirPlay connection that last reported itself playing, i.e. the one [`Source::Airplay`]
+    /// currently means. Tracked separately from `airplay_dacp` above because a session can be the
+    /// active source without ever offering remote control.
+    #[cfg(feature = "airplay")]
+    airplay_connection: Option<u64>,
+    /// Set alongside `airplay_events`. What `setvol` acts on while AirPlay is the source: an
+    /// AirPlay 2 sender offers no way to be told to change *its* volume that this crate can reach
+    /// (no `Active-Remote`/`DACP-ID` headers on that path), so the volume a client sets is this
+    /// receiver's own output gain.
+    #[cfg(feature = "airplay")]
+    airplay_control: Option<AirplayControl>,
+}
+
+/// Which source `next`/`pause`/`resume` control: **whichever one last played**. Moved only by a
+/// *positive* "now playing" signal (`PlayerEvent::Playing` /
+/// `AirplayEvent::PlaybackChanged{is_playing: true}`) — nothing else, so neither pausing a source
+/// nor its session ending reassigns control to the other one. Control routing and now-playing
+/// display only: it does not pause one source's audio when the other starts.
+///
+/// That a stopped source keeps control is the point rather than an oversight: a paused phone is
+/// still what the user was listening to, and its DACP server outlives the AirPlay session, so
+/// `resume` can reach it. Routing to an idle Spotify session instead would send `resume` to a
+/// spirc with nothing loaded — silence, and no way back to the music that was playing.
+#[cfg(feature = "airplay")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Source {
+    #[default]
+    Spotify,
+    Airplay,
+}
+
+/// A free function, not a method: `select!` needs each branch to borrow only the field it uses,
+/// and a `&mut self` method would conflict with every other branch. `None` never resolves, so
+/// the branch simply never fires.
+#[cfg(feature = "airplay")]
+async fn recv_airplay_event(
+    rx: &mut Option<mpsc::UnboundedReceiver<AirplayEvent>>,
+) -> Option<AirplayEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl ApiServerTask {
+    /// Two full definitions rather than `#[cfg]`s inside one `select!`: per-branch `#[cfg]`,
+    /// though documented as supported, fails with a macro-parse error for this branch shape on
+    /// the pinned `tokio`.
+    #[cfg(feature = "airplay")]
     async fn run(mut self) {
         let mut buf = [0u8; MAX_DATAGRAM_SIZE];
         // the player outlives this task, but don't spin on a closed channel if it doesn't
@@ -715,10 +813,55 @@ impl ApiServerTask {
                         self.spirc = Some(spirc);
                         self.session = Some(session);
                     }
+                    Some(ApiServerCommand::SetAirplay { events, control }) => {
+                        debug!("API server got the AirPlay event stream");
+                        self.airplay_events = Some(events);
+                        self.airplay_control = Some(control);
+                    }
                     // the handle was dropped or shut down
                     None => break,
                 },
                 // this task holds the sender, so the channel cannot close under it
+                Some(fetched) = self.cover_rx.recv() => self.handle_cover(fetched).await,
+                event = self.player_events.recv(), if player_events_open => match event {
+                    Some(event) => self.handle_player_event(event).await,
+                    None => {
+                        debug!("player event channel closed");
+                        player_events_open = false;
+                    }
+                },
+                event = recv_airplay_event(&mut self.airplay_events) => match event {
+                    Some(event) => self.handle_airplay_event(event).await,
+                    None => {
+                        debug!("AirPlay event channel closed");
+                        self.airplay_events = None;
+                    }
+                },
+                received = self.socket.recv_from(&mut buf) => match received {
+                    Ok((len, peer)) => self.handle_request(&buf[..len], peer).await,
+                    Err(e) => warn!("could not receive on the API socket: {e}"),
+                },
+            }
+        }
+    }
+
+    /// See the `#[cfg(feature = "airplay")]` twin above for why this is a full second copy rather
+    /// than one `#[cfg]`-laden body — identical except for the one AirPlay-events branch.
+    #[cfg(not(feature = "airplay"))]
+    async fn run(mut self) {
+        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
+        let mut player_events_open = true;
+
+        loop {
+            tokio::select! {
+                cmd = self.cmd_rx.recv() => match cmd {
+                    Some(ApiServerCommand::SetSession { spirc, session }) => {
+                        debug!("API server got a new session");
+                        self.spirc = Some(spirc);
+                        self.session = Some(session);
+                    }
+                    None => break,
+                },
                 Some(fetched) = self.cover_rx.recv() => self.handle_cover(fetched).await,
                 event = self.player_events.recv(), if player_events_open => match event {
                     Some(event) => self.handle_player_event(event).await,
@@ -744,12 +887,17 @@ impl ApiServerTask {
                 debug!("changing currently played song to {}", audio_item.name);
 
                 // the response keeps no urls, so pick the cover before converting
-                let wanted = cover_to_ship(&audio_item.covers).map(WantedCover::from);
+                let cover_url = cover_to_ship(&audio_item.covers).map(|cover| cover.url.clone());
 
                 self.current_track = TrackResponse::from(*audio_item);
-                self.load_cover(wanted).await;
+                self.load_cover(cover_url);
+                self.announce_track().await;
             }
             PlayerEvent::Playing { position_ms, .. } => {
+                #[cfg(feature = "airplay")]
+                {
+                    self.active_source = Source::Spotify;
+                }
                 self.update_playback(Some(true), position_ms).await
             }
             PlayerEvent::Paused { position_ms, .. } => {
@@ -767,67 +915,334 @@ impl ApiServerTask {
                 self.broadcast(encode(&Event::VolumeChanged { volume }))
                     .await;
             }
+            // Nobody is connected to this device on Spotify any more. What it was reporting
+            // describes a session that is over, so it goes — see [`Self::clear_now_playing`].
+            PlayerEvent::SessionDisconnected { .. } => {
+                #[cfg(feature = "airplay")]
+                if self.active_source != Source::Spotify {
+                    debug!("Spotify disconnected, but AirPlay is the source: keeping its track");
+                    return;
+                }
+                debug!("Spotify disconnected: clearing what it was playing");
+                self.clear_now_playing().await;
+            }
             _ => (),
         }
     }
 
-    /// Puts the cover of the current track on it, and announces the track.
+    /// Forgets the track, its cover and the playback position, and tells subscribers.
     ///
-    /// When the bytes have to be fetched, the announcement waits for them, so that clients get the
-    /// track and its picture in one event. The fetch itself runs off the loop, which has to stay
-    /// responsive meanwhile, and always reports back — so the event goes out either way.
-    async fn load_cover(&mut self, wanted: Option<WantedCover>) {
-        self.pending_cover = None;
-
-        if let Some(wanted) = wanted {
-            if let Some(cover) = self.covers.get(&wanted.url).cloned() {
-                self.attach_cover(&cover, &wanted);
-            } else if let Some(session) = self.session.clone() {
-                tokio::spawn(fetch_cover(
-                    session,
-                    wanted.url.clone(),
-                    self.cover_tx.clone(),
-                ));
-                self.pending_cover = Some(wanted);
-
-                return;
-            } else {
-                // before the first connect there is nothing to fetch with
-                debug!("no session to fetch the cover with yet");
-            }
-        }
-
+    /// A source that has gone away leaves its last track behind otherwise, and a client has no
+    /// way to tell that from something still playing — it would keep showing a track and a
+    /// counting position for a session that ended. An empty track is the same shape as any other,
+    /// so nothing special is needed to display it.
+    ///
+    /// The volume is left alone: it belongs to this device's output, not to whoever was playing.
+    async fn clear_now_playing(&mut self) {
+        self.current_track = TrackResponse::default();
+        self.current_cover = None;
         self.announce_track().await;
+        self.update_playback(Some(false), 0).await;
     }
 
-    /// Takes a fetched cover, and announces the track that was waiting for it.
-    async fn handle_cover(&mut self, fetched: CoverFetched) {
-        // worth keeping even if nothing is waiting for it any more: whatever overtook this fetch
-        // was most likely a skip, and a skip back wants this picture again
-        if let Some(cover) = fetched.cover.clone() {
-            self.covers.insert(fetched.url.clone(), cover);
-        }
+    /// Is this the AirPlay session whose state this server publishes? AirPlay writes through the
+    /// same fields Spotify's events use, so anything from a session that isn't on the air is
+    /// dropped rather than written.
+    ///
+    /// Both halves earn their place: `active_source` stops a `TEARDOWN` publishing "paused,
+    /// position 0" over live Spotify state, and the connection number stops an abandoned session
+    /// speaking for a live one.
+    ///
+    /// Known limitation of having one published state: an AirPlay session that keeps playing
+    /// while Spotify holds the source loses its track updates, and shows the previous track until
+    /// the next change once it takes the source back. Per-source state would fix that; this
+    /// receiver has no arbiter letting two sources play at once anyway (see [`Source`]).
+    #[cfg(feature = "airplay")]
+    fn airplay_is_on_the_air(&self, connection: u64) -> bool {
+        self.active_source == Source::Airplay && self.airplay_connection == Some(connection)
+    }
 
-        let Some(wanted) = self
-            .pending_cover
-            .take_if(|wanted| wanted.url == fetched.url)
-        else {
-            // a newer track overtook this fetch, and brings its own event along
+    /// Keeps the session on the air in the same fields Spotify's own events update above — see
+    /// [`Self::airplay_is_on_the_air`] for what gets dropped, and [`Source`] for the routing rule
+    /// `PlaybackChanged{is_playing: true}` triggers.
+    #[cfg(feature = "airplay")]
+    async fn handle_airplay_event(&mut self, event: AirplayEvent) {
+        match event {
+            #[cfg(feature = "airplay-remote-control")]
+            AirplayEvent::DacpAvailable {
+                connection,
+                host,
+                port,
+                active_remote,
+                machine_number,
+                local_bind,
+                scope_id,
+            } => {
+                debug!("AirPlay DACP control available at {host}:{port} (connection {connection})");
+                self.airplay_dacp = Some((
+                    connection,
+                    DacpTarget {
+                        host,
+                        port,
+                        active_remote,
+                        local_bind,
+                        machine_number,
+                        scope_id,
+                    },
+                ));
+            }
+            // Without the feature nothing can resolve a target to store; this arm only keeps the
+            // match exhaustive.
+            #[cfg(not(feature = "airplay-remote-control"))]
+            AirplayEvent::DacpAvailable { .. } => {}
+            AirplayEvent::PlaybackChanged {
+                connection,
+                is_playing,
+                position_ms,
+            } => {
+                // Starting to play is the one event that doesn't need to already be on the air —
+                // it's what *puts* a session on the air.
+                if is_playing {
+                    self.active_source = Source::Airplay;
+                    self.airplay_connection = Some(connection);
+                } else if !self.airplay_is_on_the_air(connection) {
+                    debug!(
+                        "ignoring a stop from AirPlay connection {connection}: it is not the \
+                         session on the air"
+                    );
+                    return;
+                }
+                // `0` when the sender didn't say where it is (`RECORD`, `TEARDOWN`, or a
+                // `playstatusupdate` without `cant`/`cast`) — the same "don't know" sentinel
+                // every other unavailable field here uses. A sender that pushes `progress:`
+                // corrects it within moments anyway.
+                self.update_playback(Some(is_playing), position_ms).await;
+            }
+            AirplayEvent::TrackChanged {
+                connection,
+                title,
+                artist,
+                album,
+                album_artist,
+                duration_ms,
+                cover,
+            } => {
+                if !self.airplay_is_on_the_air(connection) {
+                    debug!(
+                        "ignoring a track from AirPlay connection {connection}: it is not the \
+                         session on the air"
+                    );
+                    return;
+                }
+                debug!("AirPlay now playing (connection {connection}): {title}");
+                self.current_cover = None;
+                self.current_track = TrackResponse {
+                    song_name: title,
+                    song_id: String::new(),
+                    song_artists: vec![artist],
+                    song_uri: String::new(),
+                    item_type: "airplay".to_string(),
+                    album,
+                    // Only the push path reports one (`assl`); empty, not the artist repeated.
+                    album_artists: if album_artist.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![album_artist]
+                    },
+                    duration_ms,
+                    is_explicit: false,
+                    source: "airplay".to_string(),
+                };
+                self.announce_track().await;
+
+                // The DACP path fetches the picture before reporting the track, so it arrives
+                // here; the push path sends it as its own request moments later.
+                if let Some((bytes, mime)) = cover {
+                    self.announce_cover(Cover { bytes, mime }).await;
+                }
+            }
+            AirplayEvent::CoverChanged {
+                connection,
+                bytes,
+                mime,
+            } => {
+                if !self.airplay_is_on_the_air(connection) {
+                    debug!(
+                        "ignoring cover art from AirPlay connection {connection}: it is not the \
+                         session on the air"
+                    );
+                    return;
+                }
+                debug!(
+                    "AirPlay cover art (connection {connection}): {} bytes",
+                    bytes.len()
+                );
+                if bytes.len() > MAX_COVER_BYTES {
+                    warn!(
+                        "AirPlay cover art is {} bytes, over the {MAX_COVER_BYTES}-byte limit — \
+                         dropped",
+                        bytes.len()
+                    );
+                    return;
+                }
+                self.announce_cover(Cover { bytes, mime }).await;
+            }
+            AirplayEvent::ProgressChanged {
+                connection,
+                position_ms,
+                duration_ms,
+            } => {
+                if !self.airplay_is_on_the_air(connection) {
+                    debug!(
+                        "ignoring progress from AirPlay connection {connection}: it is not the \
+                         session on the air"
+                    );
+                    return;
+                }
+                // Better than no duration, but never overrides the metadata's: `astm` is the
+                // track's length, while `progress:` describes the stretch being streamed.
+                if self.current_track.duration_ms == 0 && duration_ms != 0 {
+                    self.current_track.duration_ms = duration_ms;
+                }
+                // Position only — `None` leaves play/pause alone, since a sender pushes progress
+                // while paused too.
+                self.update_playback(None, position_ms).await;
+            }
+            AirplayEvent::VolumeChanged {
+                connection,
+                percent,
+            } => {
+                if !self.airplay_is_on_the_air(connection) {
+                    debug!(
+                        "ignoring the volume from AirPlay connection {connection}: it is not the \
+                         session on the air"
+                    );
+                    return;
+                }
+                debug!("AirPlay volume (connection {connection}): {percent}%");
+                let volume = volume_from_percent(percent);
+                self.current_volume.volume = volume;
+                self.broadcast(encode(&Event::VolumeChanged { volume }))
+                    .await;
+            }
+            AirplayEvent::SessionEnded { connection } => {
+                // Named connection only: another session may already have taken over.
+                if self.airplay_connection != Some(connection) {
+                    return;
+                }
+                let was_on_the_air = self.airplay_is_on_the_air(connection);
+                self.airplay_connection = None;
+
+                // Whatever it was playing is over, so it stops being reported — the same rule
+                // Spotify's own disconnect follows (see `clear_now_playing`). Only when this
+                // session was the one on the air: a sender that stops while Spotify plays must
+                // not wipe Spotify's track.
+                if was_on_the_air {
+                    debug!("AirPlay connection {connection} ended: clearing what it was playing");
+                    self.clear_now_playing().await;
+                }
+
+                // The DACP endpoint deliberately **survives** its session, exactly as in
+                // shairport-sync: `relinquish_dacp_server_information` zeroes only the "which
+                // connection owns playback" index and leaves address, port and `Active-Remote`
+                // alone. A stopped sender still runs its DACP server, and that endpoint is the
+                // only thing that can tell it to play again — so control stays with it too, even
+                // when there is a Spotify session sitting there idle. Handing it back on
+                // `TEARDOWN` is what made `resume` unable to restart a phone that had just been
+                // paused: the command went to a spirc with nothing loaded, and the sender, the
+                // one thing that *was* playing, never heard it. `PlayerEvent::Playing` takes the
+                // source back the moment Spotify actually plays something.
+                debug!(
+                    "AirPlay connection {connection} ended: transport commands keep going to the \
+                     sender, which is what last played"
+                );
+            }
+        }
+    }
+
+    /// Starts fetching the cover of the track that just changed, if it isn't already held.
+    ///
+    /// The track event does **not** wait for it: covers travel only in answer to a `cover`
+    /// request now, so there is nothing to hold the announcement for. A client learns the picture
+    /// arrived from [`Event::CoverAvailable`] and asks for it when it wants it.
+    fn load_cover(&mut self, url: Option<String>) {
+        self.current_cover = None;
+
+        let Some(url) = url else {
+            return;
+        };
+        if let Some(cover) = self.covers.get(&url).cloned() {
+            self.current_cover = Some(cover);
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            // before the first connect there is nothing to fetch with
+            debug!("no session to fetch the cover with yet");
+            return;
+        };
+        tokio::spawn(fetch_cover(session, url, self.cover_tx.clone()));
+    }
+
+    /// Takes a fetched cover and tells subscribers it is there to be asked for.
+    async fn handle_cover(&mut self, fetched: CoverFetched) {
+        // worth keeping even if a newer track overtook this fetch: whatever overtook it was most
+        // likely a skip, and a skip back wants this picture again
+        let Some(cover) = fetched.cover else {
+            return;
+        };
+        self.covers.insert(fetched.url, cover.clone());
+
+        self.announce_cover(cover).await;
+    }
+
+    /// Holds a cover for the current track and tells subscribers it can be asked for.
+    async fn announce_cover(&mut self, cover: Cover) {
+        let payload = encode(&Event::CoverAvailable {
+            mime: cover.mime,
+            bytes: cover.bytes.len(),
+        });
+        self.current_cover = Some(cover);
+        self.broadcast(payload).await;
+    }
+
+    /// Answers `cover` with the current picture, split across as many datagrams as it takes.
+    ///
+    /// One response per chunk, in order, each carrying its index and the total — so a client can
+    /// reassemble them and tell a lost one from the end of the picture. A track with no cover
+    /// (yet) is answered with a single `count: 0`, which is a real answer rather than silence.
+    async fn send_cover(&self, peer: SocketAddr) {
+        let Some(cover) = &self.current_cover else {
+            self.reply(
+                &Event::CoverChunk {
+                    mime: "",
+                    index: 0,
+                    count: 0,
+                    data: String::new(),
+                },
+                peer,
+            )
+            .await;
             return;
         };
 
-        if let Some(cover) = fetched.cover {
-            self.attach_cover(&cover, &wanted);
+        let chunks: Vec<&[u8]> = cover.bytes.chunks(COVER_CHUNK_BYTES).collect();
+        debug!(
+            "sending {} bytes of cover to {peer} in {} chunks",
+            cover.bytes.len(),
+            chunks.len()
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.reply(
+                &Event::CoverChunk {
+                    mime: cover.mime,
+                    index,
+                    count: chunks.len(),
+                    data: BASE64.encode(chunk),
+                },
+                peer,
+            )
+            .await;
         }
-
-        self.announce_track().await;
-    }
-
-    fn attach_cover(&mut self, cover: &Cover, wanted: &WantedCover) {
-        self.current_track.cover_data = cover.data.clone();
-        self.current_track.cover_mime = cover.mime.to_string();
-        self.current_track.cover_width = wanted.width;
-        self.current_track.cover_height = wanted.height;
     }
 
     async fn announce_track(&mut self) {
@@ -860,52 +1275,43 @@ impl ApiServerTask {
 
         // subscription keepalives arrive every lease period, so they stay at `debug`;
         // everything else is a user-triggered command and is worth seeing without RUST_LOG
-        if matches!(command, "subscribe" | "subscribe_refresh" | "unsubscribe") {
+        if matches!(command, "subscribe" | "unsubscribe") {
             debug!("received '{command}' from {peer}");
         } else {
             info!("received '{command}' from {peer}");
         }
 
         match command {
-            "next" => self.command(command, Spirc::next),
-            "pause" => self.command(command, Spirc::pause),
-            "resume" => self.command(command, |spirc| {
-                // the device may be idle, so take over playback before resuming
-                spirc.activate()?;
-                spirc.play()
-            }),
+            "next" => self.control(command, Spirc::next, "nextitem"),
+            "pause" => self.control(command, Spirc::pause, "pause"),
+            "resume" => self.control(
+                command,
+                |spirc| {
+                    // the device may be idle, so take over playback before resuming
+                    spirc.activate()?;
+                    spirc.play()
+                },
+                "play",
+            ),
             "volup" => self.command(command, Spirc::volume_up),
             "voldown" => self.command(command, Spirc::volume_down),
             "setvol" => match serde_json::from_str::<SetVolumeRequest>(payload) {
                 Ok(request) => {
                     let percentage = (request.volume as f64 / u16::MAX as f64) * 100.0;
                     debug!("setting volume to {percentage:.2}%");
-                    self.command(command, |spirc| spirc.set_volume(request.volume));
+                    self.set_volume(command, request.volume);
                 }
                 Err(e) => warn!("invalid `setvol` payload '{payload}' from {peer}: {e}"),
             },
             "getvol" => self.reply(&self.current_volume, peer).await,
             "current_track" => self.reply(&self.current_track, peer).await,
+            "cover" => self.send_cover(peer).await,
             "status" => self.reply(&self.snapshot(), peer).await,
+            // Also the keepalive: renewing is subscribing again, which costs one small datagram
+            // now that no response carries a picture.
             "subscribe" => {
                 self.renew_lease(peer);
-                // the full state, cover included: this is what a client asks for when it needs
-                // the picture, be it on startup or because the track changed under it
                 self.reply(&self.snapshot(), peer).await;
-            }
-            "subscribe_refresh" => {
-                self.renew_lease(peer);
-
-                // the same re-sync, minus the cover the client already has — the bytes are what
-                // makes a datagram fragment, and a keepalive should not pay for them every few
-                // seconds. A client that finds `song_uri` changed asks for the whole thing.
-                let cover = std::mem::take(&mut self.current_track.cover_data);
-                let payload = encode(&self.snapshot());
-                self.current_track.cover_data = cover;
-
-                if let Some(payload) = payload {
-                    self.send(&payload, peer).await;
-                }
             }
             "unsubscribe" => {
                 if self.subscribers.remove(&peer).is_some() {
@@ -946,6 +1352,71 @@ impl ApiServerTask {
             }
             None => warn!("cannot handle `{name}`: not connected to Spotify yet"),
         }
+    }
+
+    /// Routes a transport command to whichever source is active: Spotify via `spirc`, AirPlay
+    /// via a DACP command sent fire-and-forget on its own task — a spirc call is local, a DACP
+    /// command is a network round trip.
+    #[cfg_attr(not(feature = "airplay-remote-control"), allow(unused_variables))]
+    fn control(
+        &self,
+        name: &str,
+        spotify: impl FnOnce(&Spirc) -> Result<(), Error>,
+        airplay_command: &'static str,
+    ) {
+        #[cfg(feature = "airplay")]
+        if self.active_source == Source::Airplay {
+            #[cfg(feature = "airplay-remote-control")]
+            match self.airplay_dacp.clone().map(|(_, target)| target) {
+                Some(target) => {
+                    tokio::spawn(async move {
+                        librespot::airplay::dacp::send_command(&target, airplay_command).await;
+                    });
+                }
+                None => warn!(
+                    "cannot handle `{name}`: AirPlay is the active source but no DACP endpoint is known yet"
+                ),
+            }
+            #[cfg(not(feature = "airplay-remote-control"))]
+            warn!(
+                "cannot handle `{name}`: AirPlay is the active source but remote control isn't compiled in"
+            );
+            return;
+        }
+
+        self.command(name, spotify);
+    }
+
+    /// `setvol`, routed like [`Self::control`] routes transport commands — a second body rather
+    /// than a parameter on that one, since the AirPlay side needs a *value*, not a fixed command
+    /// string. The conversion to the sender's 0..=100 happens here, on the side that knows what
+    /// scale it publishes.
+    #[cfg_attr(not(feature = "airplay"), allow(unused_variables))]
+    fn set_volume(&self, name: &str, volume: u16) {
+        #[cfg(feature = "airplay")]
+        if self.active_source == Source::Airplay {
+            let percent = percent_from_volume(volume);
+
+            // A DACP endpoint, when there is one, moves the *sender's* own volume — which is what
+            // a classic-path sender expects. An AirPlay 2 sender never offers one, so the volume
+            // is applied to this receiver's output instead (`AirplayControl`). Both are "make it
+            // quieter", and a client can't act on the difference.
+            #[cfg(feature = "airplay-remote-control")]
+            if let Some((_, target)) = self.airplay_dacp.clone() {
+                tokio::spawn(async move {
+                    librespot::airplay::dacp::set_volume(&target, percent).await;
+                });
+                return;
+            }
+
+            match &self.airplay_control {
+                Some(control) => control.set_volume(percent),
+                None => warn!("cannot handle `{name}`: AirPlay is not running"),
+            }
+            return;
+        }
+
+        self.command(name, |spirc| spirc.set_volume(volume));
     }
 
     /// Sends an event to every subscriber whose lease is still good.
@@ -1077,14 +1548,17 @@ mod tests {
         assert_eq!(json["album_artists"][0], "Bob Marley");
         assert_eq!(json["duration_ms"], 213_000);
         assert_eq!(json["is_explicit"], false);
+        assert_eq!(json["source"], "spotify");
 
         // no urls: what a client cannot reach is not worth reporting
         assert!(json.get("cover_url").is_none());
         assert!(json.get("covers").is_none());
     }
 
+    /// The best one on offer: size stopped being a reason to compromise once covers got their
+    /// own chunked command instead of riding along in every track event.
     #[test]
-    fn the_shipped_cover_is_the_smallest_one_big_enough() {
+    fn the_cover_fetched_is_the_largest_on_offer() {
         let covers = |edges: &[i32]| -> Vec<CoverImage> {
             edges
                 .iter()
@@ -1092,18 +1566,16 @@ mod tests {
                 .collect()
         };
 
-        // covers arrive largest first, and 300 is the smallest that still covers 200px of display
-        let big_enough = covers(&[640, 300, 64]);
-        assert_eq!(cover_to_ship(&big_enough).expect("picks one").width, 300);
-
-        // exactly the wanted width is big enough
-        let exact = covers(&[640, 200]);
-        assert_eq!(cover_to_ship(&exact).expect("picks one").width, 200);
-
-        // nothing worth shipping when everything on offer is too small to display
-        let all_small = covers(&[64, 32]);
-        assert!(cover_to_ship(&all_small).is_none());
-
+        assert_eq!(
+            cover_to_ship(&covers(&[640, 300, 64]))
+                .expect("picks one")
+                .width,
+            640
+        );
+        assert_eq!(
+            cover_to_ship(&covers(&[64, 32])).expect("picks one").width,
+            64
+        );
         assert!(cover_to_ship(&[]).is_none());
     }
 
@@ -1126,7 +1598,7 @@ mod tests {
             cache.insert(
                 format!("url-{i}"),
                 Cover {
-                    data: i.to_string(),
+                    bytes: i.to_string().into_bytes(),
                     mime: "image/jpeg",
                 },
             );
@@ -1137,8 +1609,8 @@ mod tests {
             cache
                 .get(&format!("url-{COVER_CACHE_SIZE}"))
                 .expect("kept")
-                .data,
-            COVER_CACHE_SIZE.to_string()
+                .bytes,
+            COVER_CACHE_SIZE.to_string().into_bytes()
         );
         assert_eq!(cache.covers.len(), COVER_CACHE_SIZE);
     }
@@ -1170,10 +1642,7 @@ mod tests {
             "album_artists",
             "duration_ms",
             "is_explicit",
-            "cover_data",
-            "cover_mime",
-            "cover_width",
-            "cover_height",
+            "source",
         ] {
             assert!(json.get(field).is_some(), "missing field {field}");
         }
@@ -1234,11 +1703,11 @@ mod tests {
 
     #[test]
     fn allow_list_matches_networks() {
-        let allow_list: AllowList = "172.30.2.0/24, 10.1.2.3".parse().expect("parses");
+        let allow_list: AllowList = "192.168.2.0/24, 10.1.2.3".parse().expect("parses");
 
-        assert!(allow_list.allows("172.30.2.1".parse().unwrap()));
-        assert!(allow_list.allows("172.30.2.255".parse().unwrap()));
-        assert!(!allow_list.allows("172.30.3.1".parse().unwrap()));
+        assert!(allow_list.allows("192.168.2.1".parse().unwrap()));
+        assert!(allow_list.allows("192.168.2.255".parse().unwrap()));
+        assert!(!allow_list.allows("192.168.3.1".parse().unwrap()));
 
         // a bare address only ever matches itself
         assert!(allow_list.allows("10.1.2.3".parse().unwrap()));
@@ -1246,12 +1715,12 @@ mod tests {
 
         // v4 rules don't cover v6 peers, but do cover v4 mapped ones
         assert!(!allow_list.allows("fd00::1".parse().unwrap()));
-        assert!(allow_list.allows("::ffff:172.30.2.1".parse().unwrap()));
+        assert!(allow_list.allows("::ffff:192.168.2.1".parse().unwrap()));
     }
 
     #[test]
     fn loopback_is_allowed_without_being_listed() {
-        let allow_list: AllowList = "172.30.2.0/24".parse().expect("parses");
+        let allow_list: AllowList = "192.168.2.0/24".parse().expect("parses");
 
         assert!(allow_list.allows("127.0.0.1".parse().unwrap()));
         // the whole 127.0.0.0/8 block, however it arrives at a dual stack socket
@@ -1260,15 +1729,15 @@ mod tests {
         assert!(allow_list.allows("::ffff:127.0.0.1".parse().unwrap()));
 
         // and it does not weaken anything else
-        assert!(!allow_list.allows("172.30.3.1".parse().unwrap()));
+        assert!(!allow_list.allows("192.168.3.1".parse().unwrap()));
     }
 
     #[test]
     fn allow_list_handles_odd_prefixes() {
-        let allow_list: AllowList = "172.30.0.0/20".parse().expect("parses");
+        let allow_list: AllowList = "192.168.0.0/20".parse().expect("parses");
 
-        assert!(allow_list.allows("172.30.15.255".parse().unwrap()));
-        assert!(!allow_list.allows("172.30.16.0".parse().unwrap()));
+        assert!(allow_list.allows("192.168.15.255".parse().unwrap()));
+        assert!(!allow_list.allows("192.168.16.0".parse().unwrap()));
 
         let allow_list: AllowList = "0.0.0.0/0".parse().expect("parses");
         assert!(allow_list.allows("8.8.8.8".parse().unwrap()));
@@ -1288,8 +1757,8 @@ mod tests {
 
     #[test]
     fn allow_list_rejects_nonsense() {
-        assert!("172.30.2.0/33".parse::<AllowList>().is_err());
-        assert!("172.30.2.0/nope".parse::<AllowList>().is_err());
+        assert!("192.168.2.0/33".parse::<AllowList>().is_err());
+        assert!("192.168.2.0/nope".parse::<AllowList>().is_err());
         assert!("not-an-address".parse::<AllowList>().is_err());
         assert!("::1/129".parse::<AllowList>().is_err());
     }
@@ -1329,12 +1798,34 @@ mod tests {
             current_volume: VolumeResponse::default(),
             playback: PlaybackState::default(),
             covers: CoverCache::default(),
-            pending_cover: None,
+            current_cover: None,
             cover_tx,
             cover_rx,
+            #[cfg(feature = "airplay")]
+            airplay_events: None,
+            #[cfg(feature = "airplay")]
+            active_source: Source::default(),
+            #[cfg(feature = "airplay-remote-control")]
+            airplay_dacp: None,
+            #[cfg(feature = "airplay")]
+            airplay_connection: None,
+            #[cfg(feature = "airplay")]
+            airplay_control: None,
         };
 
         (task, events, cmd_tx)
+    }
+
+    /// An AirPlay session reporting that it started or stopped playing. A helper because every
+    /// test that wants a session on the air has to send one of these first, and none of them care
+    /// about the position.
+    #[cfg(feature = "airplay")]
+    fn airplay_playing(connection: u64, is_playing: bool) -> AirplayEvent {
+        AirplayEvent::PlaybackChanged {
+            connection,
+            is_playing,
+            position_ms: 0,
+        }
     }
 
     impl TestServer {
@@ -1392,6 +1883,77 @@ mod tests {
         }
     }
 
+    /// No response carries a picture any more — a track event is small, and the cover is asked
+    /// for separately. This is what keeps a datagram from exceeding what the OS will send: a real
+    /// sender's artwork runs to ~180 kB, which base64 turns into 240 kB, well past the 65507-byte
+    /// ceiling.
+    #[tokio::test]
+    async fn no_response_carries_the_cover() {
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            task.current_cover = Some(Cover {
+                bytes: vec![0xff; 8 * 1024],
+                mime: "image/jpeg",
+            });
+        })
+        .await;
+
+        server.request("current_track").await;
+        let track = server.receive().await;
+        for absent in ["cover_data", "cover_mime", "cover_width", "cover_height"] {
+            assert!(track.get(absent).is_none(), "{absent} should be gone");
+        }
+
+        server.request("status").await;
+        let snapshot = server.receive().await;
+        assert!(snapshot["track"].get("cover_data").is_none());
+    }
+
+    /// The cover arrives in as many datagrams as it takes, each small enough to send anywhere,
+    /// each saying which of how many it is.
+    #[tokio::test]
+    async fn the_cover_command_answers_in_chunks() {
+        const SIZE: usize = COVER_CHUNK_BYTES * 2 + 100;
+
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            task.current_cover = Some(Cover {
+                bytes: vec![0xab; SIZE],
+                mime: "image/jpeg",
+            });
+        })
+        .await;
+
+        server.request("cover").await;
+
+        let mut reassembled = Vec::new();
+        for expected_index in 0..3 {
+            let chunk = server.receive().await;
+            assert_eq!(chunk["event"], "cover_chunk");
+            assert_eq!(chunk["index"], expected_index);
+            assert_eq!(chunk["count"], 3);
+            assert_eq!(chunk["mime"], "image/jpeg");
+            reassembled.extend(
+                BASE64
+                    .decode(chunk["data"].as_str().expect("base64 text").as_bytes())
+                    .expect("valid base64"),
+            );
+        }
+
+        assert_eq!(reassembled, vec![0xab; SIZE]);
+    }
+
+    /// A track with no cover is answered, not met with silence — a client waiting for a reply
+    /// would otherwise wait forever.
+    #[tokio::test]
+    async fn asking_for_a_cover_that_is_not_there_is_still_answered() {
+        let server = TestServer::start(AllowList::default()).await;
+
+        server.request("cover").await;
+
+        let answer = server.receive().await;
+        assert_eq!(answer["event"], "cover_chunk");
+        assert_eq!(answer["count"], 0);
+    }
+
     #[tokio::test]
     async fn subscribers_are_pushed_to_until_they_unsubscribe() {
         let server = TestServer::start(AllowList::default()).await;
@@ -1425,8 +1987,6 @@ mod tests {
         let event = server.receive().await;
         assert_eq!(event["event"], "track_changed");
         assert_eq!(event["track"]["song_name"], "Sun Is Shining");
-        // there is no session here to fetch a cover with, so the event goes out without one
-        assert_eq!(event["track"]["cover_data"], "");
 
         server.request("unsubscribe").await;
         // the answer to this proves the unsubscribe was handled before the event below
@@ -1444,114 +2004,360 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_track_event_carries_the_cover_bytes() {
-        const JPEG: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03];
-
-        let server = TestServer::start_with(AllowList::default(), |task| {
-            task.covers.insert(
-                COVER_URL.to_string(),
-                Cover {
-                    data: BASE64.encode(JPEG),
-                    mime: "image/jpeg",
-                },
-            );
-        })
-        .await;
-
-        server.request("subscribe").await;
-        assert_eq!(server.receive().await["event"], "snapshot");
-
-        server
-            .events
-            .send(PlayerEvent::TrackChanged {
-                audio_item: Box::new(audio_item(UniqueFields::Track {
-                    artists: ArtistsWithRole(vec![artist("Bob Marley")]),
-                    album: "Kaya".to_string(),
-                    album_artists: Vec::new(),
-                    popularity: 42,
-                    number: 3,
-                    disc_number: 1,
-                })),
-            })
-            .expect("the task is running");
-
-        let event = server.receive().await;
-        assert_eq!(event["event"], "track_changed");
-
-        let track = &event["track"];
-        assert_eq!(track["cover_data"], BASE64.encode(JPEG));
-        assert_eq!(track["cover_mime"], "image/jpeg");
-        // the 300px one, not the 640px the fixture also offers
-        assert_eq!(track["cover_width"], 300);
-        assert_eq!(track["cover_height"], 300);
-
-        // and a client that polls instead of subscribing gets the same picture
-        server.request("current_track").await;
-        assert_eq!(server.receive().await["cover_data"], BASE64.encode(JPEG));
+    /// Clients see one volume scale whichever source is playing, so the ends of DACP's 0..=100
+    /// have to land exactly on the ends of this server's own range.
+    #[cfg(feature = "airplay")]
+    #[test]
+    fn the_volume_scales_line_up_at_both_ends() {
+        assert_eq!(volume_from_percent(0), 0);
+        assert_eq!(volume_from_percent(100), u16::MAX);
+        assert_eq!(volume_from_percent(50), 32768);
+        // A sender reporting nonsense is clamped, not wrapped around.
+        assert_eq!(volume_from_percent(200), u16::MAX);
     }
 
-    #[tokio::test]
-    async fn a_keepalive_re_syncs_without_resending_the_cover() {
-        const JPEG: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03];
+    #[cfg(feature = "airplay")]
+    #[test]
+    fn a_volume_survives_the_round_trip_to_a_percentage() {
+        assert_eq!(percent_from_volume(0), 0);
+        assert_eq!(percent_from_volume(u16::MAX), 100);
+        for percent in [0, 1, 37, 50, 99, 100] {
+            assert_eq!(percent_from_volume(volume_from_percent(percent)), percent);
+        }
+    }
 
-        let server = TestServer::start_with(AllowList::default(), |task| {
-            task.covers.insert(
-                COVER_URL.to_string(),
-                Cover {
-                    data: BASE64.encode(JPEG),
-                    mime: "image/jpeg",
-                },
-            );
+    /// AirPlay's volume has to reach the same field `getvol` answers from, or a client would ask
+    /// for the volume and get Spotify's while AirPlay is what it can hear.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn an_airplay_volume_becomes_the_reported_volume() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+        task.handle_airplay_event(AirplayEvent::VolumeChanged {
+            connection: 1,
+            percent: 50,
         })
         .await;
 
-        // a keepalive subscribes a client that isn't on the list yet, so a lost lease is not fatal
-        server.request("subscribe_refresh").await;
-        assert_eq!(server.receive().await["event"], "snapshot");
+        assert_eq!(task.current_volume.volume, 32768);
+    }
 
-        server
-            .events
-            .send(PlayerEvent::TrackChanged {
-                audio_item: Box::new(audio_item(UniqueFields::Track {
-                    artists: ArtistsWithRole(vec![artist("Bob Marley")]),
-                    album: "Kaya".to_string(),
-                    album_artists: Vec::new(),
-                    popularity: 42,
-                    number: 3,
-                    disc_number: 1,
-                })),
-            })
-            .expect("the task is running");
+    /// The published state describes whatever is actually on the air, so an AirPlay session
+    /// ending while Spotify plays must not report "stopped" over live Spotify playback — the
+    /// `TEARDOWN` case this guard was written for.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn an_airplay_teardown_does_not_report_over_spotify() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
 
-        // proving it was subscribed: the track event arrives, with the cover
-        let event = server.receive().await;
-        assert_eq!(event["event"], "track_changed");
-        assert_eq!(event["track"]["cover_data"], BASE64.encode(JPEG));
+        // AirPlay played, then Spotify took the source back (what `PlayerEvent::Playing` does).
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+        task.active_source = Source::Spotify;
+        task.playback.update(Some(true), 42_000);
 
-        server.request("subscribe_refresh").await;
-        let snapshot = server.receive().await;
+        // The AirPlay session is torn down: `PlaybackChanged`, then `SessionEnded`.
+        task.handle_airplay_event(airplay_playing(1, false)).await;
+        task.handle_airplay_event(AirplayEvent::SessionEnded { connection: 1 })
+            .await;
 
-        // the state is re-synced in full, so a client can tell whether its picture is still current
-        assert_eq!(snapshot["event"], "snapshot");
-        assert_eq!(snapshot["track"]["song_name"], "Sun Is Shining");
-        assert_eq!(snapshot["track"]["song_uri"], TRACK_URI);
-        // but the bytes are left out, which is the whole point of the keepalive
-        assert_eq!(snapshot["track"]["cover_data"], "");
-
-        // and holding them back does not lose them: `subscribe` still hands over the picture
-        server.request("subscribe").await;
-        assert_eq!(
-            server.receive().await["track"]["cover_data"],
-            BASE64.encode(JPEG)
+        assert!(
+            task.playback.is_playing,
+            "Spotify was playing and nothing about it changed"
         );
+        assert_eq!(task.playback.position_ms, 42_000);
+    }
+
+    /// A cover far past anything legitimate is refused rather than held.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn an_oversized_airplay_cover_is_dropped() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+
+        task.handle_airplay_event(AirplayEvent::CoverChanged {
+            connection: 1,
+            bytes: vec![0xff; MAX_COVER_BYTES + 1],
+            mime: "image/jpeg",
+        })
+        .await;
+
+        assert!(task.current_cover.is_none());
+    }
+
+    /// A sender's own artwork is held whole — no size compromise, since it leaves in chunks.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn an_airplay_cover_is_held_for_the_cover_command() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+
+        // The size a real iPhone pushes, which no single datagram could ever carry.
+        let jpeg: Vec<u8> = vec![0xff; 180 * 1024];
+        task.handle_airplay_event(AirplayEvent::CoverChanged {
+            connection: 1,
+            bytes: jpeg.clone(),
+            mime: "image/jpeg",
+        })
+        .await;
+
+        let held = task.current_cover.expect("held for the `cover` command");
+        assert_eq!(held.bytes, jpeg);
+        assert_eq!(held.mime, "image/jpeg");
+    }
+
+    /// The same filter, for an abandoned session that is still polling: whatever it reports is
+    /// about a session nobody is listening to.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn a_stale_sessions_track_is_not_published() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        let track_changed = |connection, title: &str| AirplayEvent::TrackChanged {
+            connection,
+            title: title.to_string(),
+            artist: "Bob Marley".to_string(),
+            album: "Kaya".to_string(),
+            album_artist: String::new(),
+            duration_ms: 213_000,
+            cover: None,
+        };
+
+        for connection in [1, 2] {
+            task.handle_airplay_event(airplay_playing(connection, true))
+                .await;
+        }
+        task.handle_airplay_event(track_changed(2, "Sun Is Shining"))
+            .await;
+
+        task.handle_airplay_event(track_changed(1, "Something Else"))
+            .await;
+
+        assert_eq!(task.current_track.song_name, "Sun Is Shining");
+    }
+
+    /// A source that goes away must not leave its last track on display: a client cannot tell
+    /// that from something still playing.
+    #[tokio::test]
+    async fn a_spotify_disconnect_clears_what_it_was_playing() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        task.current_track = TrackResponse {
+            song_name: "Sun Is Shining".to_string(),
+            source: "spotify".to_string(),
+            ..TrackResponse::default()
+        };
+        task.current_cover = Some(Cover {
+            bytes: vec![0xff; 16],
+            mime: "image/jpeg",
+        });
+        task.playback.update(Some(true), 42_000);
+
+        task.handle_player_event(PlayerEvent::SessionDisconnected {
+            connection_id: String::new(),
+            user_name: String::new(),
+        })
+        .await;
+
+        assert!(task.current_track.song_name.is_empty());
+        assert!(task.current_cover.is_none());
+        assert!(!task.playback.is_playing);
+        assert_eq!(task.playback.position_ms, 0);
+    }
+
+    /// The same, for the other source.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn an_airplay_session_ending_clears_what_it_was_playing() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+        task.handle_airplay_event(AirplayEvent::TrackChanged {
+            connection: 1,
+            title: "Enemy".to_string(),
+            artist: "Father Of Peace".to_string(),
+            album: "The Year Of Madness".to_string(),
+            album_artist: String::new(),
+            duration_ms: 205_615,
+            cover: None,
+        })
+        .await;
+        assert_eq!(task.current_track.song_name, "Enemy");
+
+        task.handle_airplay_event(AirplayEvent::SessionEnded { connection: 1 })
+            .await;
+
+        assert!(task.current_track.song_name.is_empty());
+        assert!(task.current_cover.is_none());
+        assert!(!task.playback.is_playing);
+    }
+
+    /// Neither source may wipe the other's track: only the one that was on the air clears.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn a_disconnect_leaves_the_other_sources_track_alone() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+
+        // AirPlay is playing; Spotify disconnects.
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+        task.handle_airplay_event(AirplayEvent::TrackChanged {
+            connection: 1,
+            title: "Enemy".to_string(),
+            artist: "Father Of Peace".to_string(),
+            album: "The Year Of Madness".to_string(),
+            album_artist: String::new(),
+            duration_ms: 205_615,
+            cover: None,
+        })
+        .await;
+
+        task.handle_player_event(PlayerEvent::SessionDisconnected {
+            connection_id: String::new(),
+            user_name: String::new(),
+        })
+        .await;
+        assert_eq!(task.current_track.song_name, "Enemy");
+
+        // Spotify is playing; an abandoned AirPlay session ends.
+        task.active_source = Source::Spotify;
+        task.current_track = TrackResponse {
+            song_name: "Sun Is Shining".to_string(),
+            source: "spotify".to_string(),
+            ..TrackResponse::default()
+        };
+
+        task.handle_airplay_event(AirplayEvent::SessionEnded { connection: 1 })
+            .await;
+        assert_eq!(task.current_track.song_name, "Sun Is Shining");
+    }
+
+    /// An ended AirPlay session keeps control, because it is still the thing that last played:
+    /// only Spotify actually starting to play takes the source back. Handing it over on
+    /// `TEARDOWN` — as this did while a Spotify session existed — sent `resume` to an idle spirc
+    /// while the paused phone, the only thing that could start the music again, heard nothing.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn a_session_ending_keeps_control_on_airplay() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+        assert_eq!(task.active_source, Source::Airplay);
+
+        // A pause is not the end of a session: a paused sender still owns the remote.
+        task.handle_airplay_event(airplay_playing(1, false)).await;
+        assert_eq!(task.active_source, Source::Airplay);
+
+        task.handle_airplay_event(AirplayEvent::SessionEnded { connection: 1 })
+            .await;
+        assert_eq!(task.active_source, Source::Airplay);
+        // The session is over even though its remote lives on, so nothing it might still report
+        // gets published (`airplay_is_on_the_air`).
+        assert_eq!(task.airplay_connection, None);
+    }
+
+    /// Spotify actually playing is the one thing that takes the source back — and, since an ended
+    /// AirPlay session no longer hands it over, the only one.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn spotify_playing_takes_the_source_back() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+        task.handle_airplay_event(AirplayEvent::SessionEnded { connection: 1 })
+            .await;
+        assert_eq!(task.active_source, Source::Airplay);
+
+        task.handle_player_event(PlayerEvent::Playing {
+            play_request_id: 0,
+            track_id: SpotifyUri::from_uri(TRACK_URI).expect("valid uri"),
+            position_ms: 0,
+        })
+        .await;
+
+        assert_eq!(task.active_source, Source::Spotify);
+    }
+
+    /// A sender's DACP server outlives the AirPlay session that revealed it — that is what makes
+    /// `resume` able to tell a stopped sender to play. shairport-sync's own
+    /// `relinquish_dacp_server_information` likewise clears only which connection owns playback,
+    /// never the endpoint.
+    #[cfg(feature = "airplay-remote-control")]
+    #[tokio::test]
+    async fn a_session_ending_keeps_its_dacp_endpoint() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+
+        task.handle_airplay_event(AirplayEvent::DacpAvailable {
+            connection: 1,
+            host: "192.168.2.5".parse().expect("parses"),
+            port: 3689,
+            active_remote: "1234567890".to_string(),
+            machine_number: 0xAABB_CCDD_EEFF,
+            scope_id: 0,
+            local_bind: None,
+        })
+        .await;
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+
+        task.handle_airplay_event(AirplayEvent::SessionEnded { connection: 1 })
+            .await;
+
+        assert!(
+            task.airplay_dacp.is_some(),
+            "the sender is still reachable, and telling it to play is the only way back"
+        );
+    }
+
+    /// A sender that reconnects (network drop, moving between rooms) opens the new connection
+    /// before the old one tears down, so the two sessions overlap and the events arrive
+    /// interleaved — the abandoned one must not take control away from the live one.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn a_stale_session_ending_leaves_a_live_one_in_control() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+
+        for connection in [1, 2] {
+            task.handle_airplay_event(airplay_playing(connection, true))
+                .await;
+        }
+
+        task.handle_airplay_event(AirplayEvent::SessionEnded { connection: 1 })
+            .await;
+
+        assert_eq!(task.active_source, Source::Airplay);
+        assert_eq!(task.airplay_connection, Some(2));
+    }
+
+    /// Which connection's endpoint is the current one, as sessions come and go.
+    #[cfg(feature = "airplay-remote-control")]
+    #[tokio::test]
+    async fn a_newer_session_replaces_an_older_sessions_endpoint() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        let dacp_available = |connection| AirplayEvent::DacpAvailable {
+            connection,
+            host: "192.168.2.5".parse().expect("parses"),
+            port: 3689,
+            active_remote: "1234567890".to_string(),
+            local_bind: None,
+            machine_number: 0xAABB_CCDD_EEFF,
+            scope_id: 0,
+        };
+
+        task.handle_airplay_event(dacp_available(2)).await;
+
+        task.handle_airplay_event(AirplayEvent::SessionEnded { connection: 2 })
+            .await;
+        assert_eq!(
+            task.airplay_dacp.as_ref().map(|(owner, _)| *owner),
+            Some(2),
+            "an ended session's endpoint stays; only another connection's replaces it"
+        );
+
+        task.handle_airplay_event(dacp_available(3)).await;
+        assert_eq!(task.airplay_dacp.as_ref().map(|(owner, _)| *owner), Some(3));
     }
 
     #[tokio::test]
     async fn the_allow_list_keeps_others_from_subscribing() {
         // driven directly rather than over the socket, because a test client is always on
         // loopback and loopback is allowed unconditionally
-        let (mut task, ..) = idle_task("172.30.2.0/24".parse().expect("parses")).await;
+        let (mut task, ..) = idle_task("192.168.2.0/24".parse().expect("parses")).await;
 
         task.handle_request(b"subscribe", "8.8.8.8:1234".parse().expect("parses"))
             .await;
@@ -1560,7 +2366,7 @@ mod tests {
             "a client outside the allow list should be dropped before its command is read"
         );
 
-        task.handle_request(b"subscribe", "172.30.2.5:1234".parse().expect("parses"))
+        task.handle_request(b"subscribe", "192.168.2.5:1234".parse().expect("parses"))
             .await;
         assert_eq!(
             task.subscribers.len(),
@@ -1571,7 +2377,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_local_client_is_served_without_being_listed() {
-        let server = TestServer::start("172.30.2.0/24".parse().expect("parses")).await;
+        let server = TestServer::start("192.168.2.0/24".parse().expect("parses")).await;
 
         server.request("subscribe").await;
 

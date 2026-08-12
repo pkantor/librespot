@@ -231,6 +231,8 @@ struct Setup {
     zeroconf_ip: Vec<std::net::IpAddr>,
     zeroconf_backend: Option<DnsSdServiceBuilder>,
     api_config: ApiServerConfig,
+    #[cfg(feature = "airplay")]
+    airplay_config: Option<librespot::airplay::AirplayConfig>,
 }
 
 async fn get_setup() -> Setup {
@@ -296,6 +298,12 @@ async fn get_setup() -> Setup {
     const LOCAL_FILE_DIR: &str = "local-file-dir";
     const API_BIND: &str = "api-bind";
     const API_ALLOW: &str = "api-allow";
+    #[cfg(feature = "airplay")]
+    const DISABLE_AIRPLAY: &str = "disable-airplay";
+    #[cfg(feature = "airplay")]
+    const AIRPLAY_PORT: &str = "airplay-port";
+    #[cfg(feature = "airplay")]
+    const AIRPLAY_BIND_IP: &str = "airplay-bind-ip";
 
     // Mostly arbitrary.
     const AP_PORT_SHORT: &str = "a";
@@ -351,6 +359,12 @@ async fn get_setup() -> Setup {
     const LOCAL_FILE_DIR_SHORT: &str = "l";
     const API_BIND_SHORT: &str = ""; // no short flag
     const API_ALLOW_SHORT: &str = ""; // no short flag
+    #[cfg(feature = "airplay")]
+    const DISABLE_AIRPLAY_SHORT: &str = ""; // no short flag
+    #[cfg(feature = "airplay")]
+    const AIRPLAY_PORT_SHORT: &str = ""; // no short flag
+    #[cfg(feature = "airplay")]
+    const AIRPLAY_BIND_IP_SHORT: &str = ""; // no short flag
 
     // Options that have different descriptions
     // depending on what backends were enabled at build time.
@@ -689,7 +703,7 @@ async fn get_setup() -> Setup {
     ).optopt(
         API_ALLOW_SHORT,
         API_ALLOW,
-        "Comma-separated IP addresses and CIDR networks allowed to use the control API, e.g. '172.30.2.0/24'. Loopback is always allowed. Defaults to allowing everyone.",
+        "Comma-separated IP addresses and CIDR networks allowed to use the control API, e.g. '192.168.2.0/24'. Loopback is always allowed. Defaults to allowing everyone.",
         "NETWORKS"
     );
 
@@ -698,6 +712,23 @@ async fn get_setup() -> Setup {
         PASSTHROUGH_SHORT,
         PASSTHROUGH,
         "Pass a raw stream to the output. Only works with the pipe and subprocess backends.",
+    );
+
+    #[cfg(feature = "airplay")]
+    opts.optflag(
+        DISABLE_AIRPLAY_SHORT,
+        DISABLE_AIRPLAY,
+        "Disable the AirPlay receiver. It runs by default, sharing this device's name (-n/--name) and audio output with Spotify Connect.",
+    ).optopt(
+        AIRPLAY_PORT_SHORT,
+        AIRPLAY_PORT,
+        "RTSP control port for the AirPlay receiver. Defaults to an OS-assigned ephemeral port.",
+        "PORT"
+    ).optopt(
+        AIRPLAY_BIND_IP_SHORT,
+        AIRPLAY_BIND_IP,
+        "Comma-separated interface IP addresses the AirPlay receiver advertises over mDNS. Defaults to all addresses on all interfaces, which on a multi-homed machine (VPNs, multiple adapters) can advertise an unreachable address alongside the real one and make the receiver invisible to real senders.",
+        "IP"
     );
 
     let args: Vec<_> = std::env::args_os()
@@ -1875,7 +1906,7 @@ async fn get_setup() -> Setup {
                         API_ALLOW,
                         API_ALLOW_SHORT,
                         &networks,
-                        "comma-separated IP addresses and CIDR networks, e.g. '172.30.2.0/24'",
+                        "comma-separated IP addresses and CIDR networks, e.g. '192.168.2.0/24'",
                         "",
                     );
                     error!("{e}");
@@ -1890,6 +1921,62 @@ async fn get_setup() -> Setup {
             allow_list,
         }
     };
+
+    #[cfg(feature = "airplay")]
+    let airplay_config = (!opt_present(DISABLE_AIRPLAY)).then(|| {
+        let port = opt_str(AIRPLAY_PORT).map(|port| {
+            port.parse().unwrap_or_else(|_| {
+                invalid_error_msg(
+                    AIRPLAY_PORT,
+                    AIRPLAY_PORT_SHORT,
+                    &port,
+                    "a valid port number",
+                    "",
+                );
+                exit(1);
+            })
+        });
+
+        // Same parsing shape as `zeroconf_ip` above. Empty (the default) means "advertise every
+        // address libmdns enumerates" — on a machine with more than one address on the same
+        // interface (a VPN adding a second IP to en0, in the case that surfaced this: see the
+        // AirPlay plan's progress notes), that includes addresses a real sender can't reach,
+        // which is exactly what made a real iPhone never show the receiver at all.
+        let airplay_bind_ip: Vec<std::net::IpAddr> = opt_str(AIRPLAY_BIND_IP)
+            .map(|bind_ip| {
+                bind_ip
+                    .split(',')
+                    .map(|s| {
+                        s.trim().parse::<std::net::IpAddr>().unwrap_or_else(|_| {
+                            invalid_error_msg(
+                                AIRPLAY_BIND_IP,
+                                AIRPLAY_BIND_IP_SHORT,
+                                s,
+                                "IPv4 and IPv6 addresses",
+                                "",
+                            );
+                            exit(1);
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        librespot::airplay::AirplayConfig {
+            // Shared with Spotify Connect rather than a separate flag — see connect_config's
+            // own `name` resolution above.
+            device_name: connect_config.name.clone(),
+            bind_ip: airplay_bind_ip,
+            port,
+            // Same backend/device/format Spotify Connect's Player uses (bound above at
+            // `let backend = ...` / `let format = ...` / `let device = ...`) — an independent
+            // `Sink` instance, not a shared one; see `librespot_airplay::sink`'s module docs for
+            // what that does and doesn't get you yet.
+            backend,
+            device: device.clone(),
+            format,
+        }
+    });
 
     Setup {
         format,
@@ -1910,6 +1997,8 @@ async fn get_setup() -> Setup {
         zeroconf_ip,
         zeroconf_backend,
         api_config,
+        #[cfg(feature = "airplay")]
+        airplay_config,
     }
 }
 
@@ -2065,6 +2154,25 @@ async fn main() {
             exit(1);
         });
 
+    #[cfg(feature = "airplay")]
+    let airplay_server = match setup.airplay_config.clone() {
+        Some(airplay_config) => {
+            let (server, airplay_events, airplay_control) =
+                librespot::airplay::AirplayServer::spawn(airplay_config)
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("could not start the AirPlay receiver: {e}");
+                        exit(1);
+                    });
+            // Lets AirPlay's now-playing/control info flow into the same UDP API Spotify
+            // Connect already reports through.
+            api_server.set_airplay_events(airplay_events, airplay_control);
+            info!("AirPlay receiver enabled");
+            Some(server)
+        }
+        None => None,
+    };
+
     loop {
         tokio::select! {
             credentials = async {
@@ -2167,6 +2275,11 @@ async fn main() {
     let mut shutdown_tasks = tokio::task::JoinSet::new();
 
     shutdown_tasks.spawn(api_server.shutdown());
+
+    #[cfg(feature = "airplay")]
+    if let Some(airplay_server) = airplay_server {
+        shutdown_tasks.spawn(airplay_server.shutdown());
+    }
 
     // Shutdown spirc if necessary
     if let Some(spirc) = spirc {

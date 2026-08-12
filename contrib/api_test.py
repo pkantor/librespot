@@ -6,29 +6,32 @@ are forwarded to the server, so this doubles as a remote control and as a refere
 what a client has to do.
 
     ./api_test.py [host] [port]
-    ./api_test.py 172.30.2.10          # the device on its own machine
+    ./api_test.py 192.168.2.10        # the device on its own machine
     ./api_test.py --raw                # print the JSON as it comes in
-    ./api_test.py --covers ./art       # write every cover received to a directory
+    ./api_test.py --covers ./art       # ask for every cover and write it to a directory
 
 Commands to type once it runs:
 
     next / pause / resume / volup / voldown
     setvol {"volume": 32768}
-    status / current_track / getvol
+    status / current_track / getvol / cover
 
 What a client has to get right, all of which this script demonstrates:
 
-  * subscribe once, then renew with `subscribe_refresh`. The refresh answers with the same
-    snapshot minus the cover bytes, which keeps a keepalive to one small datagram.
-  * a track carries its cover as bytes (`cover_data`, base64) and by no other means. When
-    the server reports a `song_uri` you have no cover for — which happens when the
-    `track_changed` push was lost, it being the only fragmented datagram — ask
-    `current_track` to get the picture.
-  * receive into a buffer of ~128 kB. A track event carrying a cover is tens of kB and
-    arrives fragmented; on Windows a short buffer does not truncate like on Linux, it fails
-    the whole `recvfrom` with WSAEMSGSIZE and the event is lost.
-  * `cover_data` is simply empty when there is no picture to be had. There are no
-    substitutes and no urls to fall back to.
+  * subscribe once, then renew with `subscribe` again, well inside the 30s lease. Renewing
+    is subscribing: the server refreshes a lease that exists and creates one that doesn't,
+    so a client that lost its lease keeps going. Every renewal answers with a snapshot,
+    which re-syncs the client after a dropped event.
+  * no response carries the cover. A track event is small; the picture is asked for with
+    `cover` and arrives as a series of `cover_chunk` datagrams to reassemble in `index`
+    order. `count` says how many to expect, and `count: 0` means this track has none.
+  * `cover_available` says a picture is ready to be asked for — the moment to send `cover`
+    if you want one. It is pushed to subscribers only.
+  * nothing is retransmitted. If a chunk goes missing (the count doesn't add up, or a
+    chunk never arrives), ask `cover` again.
+  * both sources look the same. `source` says `"spotify"` or `"airplay"`; the events and
+    the track shape are identical, and fields that don't apply to a source are empty
+    rather than missing.
 """
 
 import argparse
@@ -43,16 +46,18 @@ from pathlib import Path
 
 DEFAULT_PORT = 50505
 
-# The server drops a subscription after 30s. Refreshing every 10s survives two lost
-# keepalives, and each refresh answers with a snapshot, which re-syncs the client after a
-# dropped event.
+# The server drops a subscription after 30s. Renewing every 10s survives two lost
+# keepalives, and each renewal answers with a snapshot, which re-syncs the client.
 KEEPALIVE_SECONDS = 10
 
-# Big enough for a track event with its cover; see the note about WSAEMSGSIZE above.
-RECV_BUFFER = 128 * 1024
+# Every datagram is small now that covers travel in chunks; this is roomy.
+RECV_BUFFER = 64 * 1024
 
-# Room for a few of those events, in case this client is busy when they arrive.
+# Room for a whole cover's worth of chunks arriving back to back while this client is busy.
 SOCKET_BUFFER = 1024 * 1024
+
+# A cover that never finishes arriving shouldn't be waited on forever.
+COVER_TIMEOUT_SECONDS = 5
 
 EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
 
@@ -66,29 +71,19 @@ def format_position(position_ms, duration_ms=0):
     return position
 
 
-def decoded_size(data):
-    """How many bytes of picture a base64 string holds, without decoding it."""
-    return len(data) * 3 // 4 - data.count("=")
-
-
 def format_track(track):
     name = track.get("song_name") or "(nothing playing)"
     artists = ", ".join(track.get("song_artists", []))
     album = track.get("album", "")
+    source = track.get("source", "")
 
     line = name
     if artists:
         line += f" - {artists}"
     if album:
         line += f" [{album}]"
-
-    cover = track.get("cover_data") or ""
-    if cover:
-        line += (
-            f"\n    cover: {track.get('cover_mime', '?')} "
-            f"{track.get('cover_width', 0)}x{track.get('cover_height', 0)}, "
-            f"{decoded_size(cover) / 1024:.1f} kB"
-        )
+    if source:
+        line += f" ({source})"
 
     return line
 
@@ -122,6 +117,18 @@ def format_event(payload):
         volume = payload.get("volume", 0)
         return f"volume_changed: {volume} ({volume / 65535 * 100:.0f}%)"
 
+    if event == "cover_available":
+        return (
+            f"cover_available: {payload.get('mime', '?')}, "
+            f"{payload.get('bytes', 0) / 1024:.1f} kB"
+        )
+
+    if event == "cover_chunk":
+        count = payload.get("count", 0)
+        if count == 0:
+            return "cover_chunk: this track has no cover"
+        return f"cover_chunk: {payload.get('index', 0) + 1} of {count}"
+
     if "song_uri" in payload:  # the answer to current_track
         return f"current_track: {format_track(payload)}"
 
@@ -129,14 +136,10 @@ def format_event(payload):
 
 
 def shorten(payload):
-    """The payload with the cover replaced by its size — 27 kB of base64 unreadable."""
-    payload = dict(payload)
-    track = payload.get("track")
-
-    if isinstance(track, dict):
-        payload["track"] = shorten(track)
-    elif payload.get("cover_data"):
-        payload["cover_data"] = f"<{decoded_size(payload['cover_data'])} bytes>"
+    """The payload with a chunk's base64 replaced by its size, so --raw stays readable."""
+    if payload.get("event") == "cover_chunk" and payload.get("data"):
+        payload = dict(payload)
+        payload["data"] = f"<{len(payload['data'])} base64 chars>"
 
     return payload
 
@@ -159,42 +162,103 @@ def read_stdin(commands):
     commands.put(None)
 
 
+class CoverAssembly:
+    """Chunks of one cover, in `index` order, until they are all there.
+
+    The server sends them in order and does not retransmit, so this holds them by index and
+    reports the picture complete once none is missing — a lost chunk simply never
+    completes, and is dealt with by asking again.
+    """
+
+    def __init__(self):
+        self.chunks = {}
+        self.count = 0
+        self.mime = ""
+        self.started = 0.0
+
+    def add(self, payload):
+        count = payload.get("count", 0)
+
+        if count != self.count:
+            # a new cover: forget a half-received one rather than mixing two pictures
+            self.chunks = {}
+            self.count = count
+            self.started = time.monotonic()
+
+        self.mime = payload.get("mime", "")
+        self.chunks[payload.get("index", 0)] = payload.get("data", "")
+
+        if self.count and len(self.chunks) == self.count:
+            data = "".join(self.chunks[index] for index in sorted(self.chunks))
+            self.chunks = {}
+            self.count = 0
+
+            return base64.b64decode(data)
+
+        return None
+
+    def timed_out(self):
+        return (
+            self.count
+            and self.started
+            and time.monotonic() - self.started > COVER_TIMEOUT_SECONDS
+        )
+
+
 class Client:
     def __init__(self, sock, server, covers_dir):
         self.sock = sock
         self.server = server
         self.covers_dir = covers_dir
-        # what we hold a picture for, and what we last asked about, so that a track without
-        # a cover on the server is asked about once rather than at every keepalive
-        self.cover_of = None
-        self.asked_about = None
+        self.assembly = CoverAssembly()
+        # the track a picture was last asked for, so a cover is requested once per track
+        self.asked_for = None
+        self.track = {}
 
     def send(self, command):
         self.sock.sendto(command.encode(), self.server)
 
     def on_track(self, track):
-        uri = track.get("song_uri") or ""
-        cover = track.get("cover_data") or ""
+        self.track = track
+        # a new track means whatever cover we were collecting is stale
+        self.assembly = CoverAssembly()
+        self.asked_for = None
 
-        if cover:
-            self.cover_of = uri
-            self.asked_about = None
-            self.save_cover(track, base64.b64decode(cover))
-        elif uri and uri != self.cover_of and uri != self.asked_about:
-            # the push that carried it must have been lost; this is the repair path
-            self.asked_about = uri
-            print("    no cover for this track, asking for it", flush=True)
-            self.send("current_track")
-
-    def save_cover(self, track, cover):
+    def on_cover_available(self):
+        """The server has a picture for what is playing; ask for it if we want one."""
         if not self.covers_dir:
             return
 
-        name = track.get("song_id") or track.get("song_uri", "cover").replace(":", "_")
-        path = self.covers_dir / f"{name}{EXTENSIONS.get(track.get('cover_mime'), '.bin')}"
+        uri = self.track.get("song_uri") or self.track.get("song_name") or ""
+        if uri == self.asked_for:
+            return
+
+        self.asked_for = uri
+        self.send("cover")
+
+    def on_cover_chunk(self, payload):
+        cover = self.assembly.add(payload)
+
+        if cover is not None:
+            self.save_cover(cover)
+
+    def save_cover(self, cover):
+        if not self.covers_dir:
+            return
+
+        track = self.track
+        name = track.get("song_id") or track.get("song_name") or "cover"
+        name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+        path = self.covers_dir / f"{name}{EXTENSIONS.get(self.assembly.mime, '.bin')}"
         path.write_bytes(cover)
 
         print(f"    saved {len(cover)} bytes to {path}", flush=True)
+
+    def check_cover_timeout(self):
+        if self.assembly.timed_out():
+            print("    a cover chunk went missing, asking again", flush=True)
+            self.assembly = CoverAssembly()
+            self.send("cover")
 
 
 def main():
@@ -205,7 +269,7 @@ def main():
         "--raw", action="store_true", help="print the JSON instead of a summary"
     )
     parser.add_argument(
-        "--covers", type=Path, help="write every cover received to this directory"
+        "--covers", type=Path, help="ask for every cover and write it to this directory"
     )
     args = parser.parse_args()
 
@@ -236,7 +300,6 @@ def main():
             except socket.timeout:
                 datagram = None
             except OSError as e:
-                # what a buffer shorter than RECV_BUFFER would get you on Windows
                 print(f"receive failed: {e}", flush=True)
                 datagram = None
 
@@ -253,9 +316,15 @@ def main():
                         flush=True,
                     )
 
-                    track = track_of(payload)
-                    if track is not None:
-                        client.on_track(track)
+                    event = payload.get("event")
+                    if event == "cover_available":
+                        client.on_cover_available()
+                    elif event == "cover_chunk":
+                        client.on_cover_chunk(payload)
+                    else:
+                        track = track_of(payload)
+                        if track is not None:
+                            client.on_track(track)
 
             while True:
                 try:
@@ -266,11 +335,13 @@ def main():
                 if command:
                     client.send(command)
 
+            client.check_cover_timeout()
+
             now = time.monotonic()
 
             if now - last_keepalive >= KEEPALIVE_SECONDS:
-                # not `subscribe`: renewing must not drag the cover along every ten seconds
-                client.send("subscribe_refresh")
+                # renewing is subscribing again; there is nothing cheaper to send
+                client.send("subscribe")
                 last_keepalive = now
     except KeyboardInterrupt:
         client.send("unsubscribe")

@@ -1,5 +1,7 @@
 #![crate_name = "librespot"]
 
+#[cfg(feature = "airplay")]
+pub use librespot_airplay as airplay;
 pub use librespot_audio as audio;
 pub use librespot_connect as connect;
 pub use librespot_core as core;
