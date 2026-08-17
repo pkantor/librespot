@@ -125,7 +125,13 @@ pub(crate) async fn serve_connection(
             return Ok(()); // peer closed the connection cleanly
         };
 
-        info!("airplay: {} {}", request.method, request.uri);
+        // `OPTIONS` is a keepalive a sender repeats every couple of seconds for as long as a
+        // session lasts; logging it at `info` would drown out everything else in `journalctl`.
+        if request.method == "OPTIONS" {
+            debug!("airplay: {} {}", request.method, request.uri);
+        } else {
+            info!("airplay: {} {}", request.method, request.uri);
+        }
         debug!(
             "airplay: headers: {:?}",
             request
