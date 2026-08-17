@@ -194,11 +194,17 @@ fn apple_challenge(
         return;
     };
 
-    let engine = base64::engine::general_purpose::STANDARD;
-    let Ok(challenge) = engine.decode(challenge.trim()) else {
-        warn!("airplay: Apple-Challenge is not base64");
+    let challenge = challenge.trim();
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(challenge)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(challenge));
+
+    let Ok(challenge) = decoded else {
+        warn!("airplay: Apple-Challenge is not valid base64");
         return;
     };
+
     if challenge.len() > 16 {
         warn!(
             "airplay: oversized Apple-Challenge ({} bytes)",
@@ -208,20 +214,24 @@ fn apple_challenge(
     }
 
     let mut buffer = challenge;
+
     match local_ip {
         std::net::IpAddr::V4(address) => buffer.extend_from_slice(&address.octets()),
         std::net::IpAddr::V6(address) => buffer.extend_from_slice(&address.octets()),
     }
+
     buffer.extend_from_slice(&device_id.bytes());
     buffer.resize(buffer.len().max(0x20), 0);
 
     let Some(signature) = crate::legacy::sign_challenge(&buffer) else {
         return;
     };
+
     response.headers.push((
         "Apple-Response".to_string(),
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(&signature),
     ));
+
     debug!("airplay: answered an Apple-Challenge");
 }
 
@@ -466,6 +476,29 @@ mod tests {
             data_port: 7002,
             local_ip: "192.168.0.196".parse().expect("parses"),
         }
+    }
+
+    #[test]
+    fn an_unpadded_apple_challenge_is_answered() {
+        let mut session = RtspSession::new();
+        let device_id = DeviceId::from_name("test-device");
+        let mut req = request("OPTIONS", "*", Vec::new());
+
+        req.headers.push((
+            "Apple-Challenge".to_string(),
+            "FZt7Pa3KHFa3gjxeAgHkrA".to_string(),
+        ));
+
+        let (response, _action) =
+            handle_request(&mut session, &device_id, "test-device", &ports(), &req);
+
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, _)| name == "Apple-Response"),
+            "an unpadded Apple-Challenge should be answered"
+        );
     }
 
     #[test]
