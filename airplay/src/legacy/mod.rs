@@ -75,20 +75,25 @@ pub(crate) struct LegacyAudioSession {
 /// the raw body of the connection's most recent `POST /fp-setup` request (threaded in by the
 /// caller, which owns the per-connection `RtspSession` this module doesn't know about), since
 /// FairPlay 3 unwrapping is keyed by that message, not by anything in the `ANNOUNCE` body itself.
+fn decode_airplay_base64(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
+}
+
 pub(crate) fn handle_announce(body: &[u8]) -> Result<LegacyAudioSession, AnnounceError> {
     let body = String::from_utf8_lossy(body);
     let announce = sdp::parse(&body);
 
-    let engine = base64::engine::general_purpose::STANDARD;
     let aes = match (announce.rsaaeskey, announce.fpaeskey, announce.aesiv) {
         (None, None, None) => None,
         (Some(rsaaeskey), None, Some(aesiv)) => {
-            let aesiv_bytes = engine.decode(aesiv)?;
+            let aesiv_bytes = decode_airplay_base64(aesiv)?;
             let aes_iv: [u8; 16] = aesiv_bytes
                 .clone()
                 .try_into()
                 .map_err(|_| AnnounceError::WrongIvLength(aesiv_bytes.len()))?;
-            let rsaaeskey_bytes = engine.decode(rsaaeskey)?;
+            let rsaaeskey_bytes = decode_airplay_base64(rsaaeskey)?;
             let aes_key = rsa_key::decrypt_aes_key(&rsaaeskey_bytes)?;
             Some((aes_key, aes_iv))
         }
@@ -321,6 +326,25 @@ mod tests {
         assert_eq!(session.aes, Some((aes_key, aes_iv)));
         assert_eq!(session.alac_format.frame_length, 352);
         assert_eq!(session.alac_format.sample_rate, 44100);
+    }
+
+    #[test]
+    fn handle_announce_accepts_unpadded_key_material() {
+        use rsa::Oaep;
+        use sha1::Sha1;
+
+        let public_key = rsa_key::embedded_public_key_for_test();
+        let aes_key = [0x33u8; 16];
+        let aes_iv = [0x44u8; 16];
+        let mut rng = rand_core::OsRng;
+        let encrypted_key = public_key
+            .encrypt(&mut rng, Oaep::new::<Sha1>(), &aes_key)
+            .unwrap();
+        let engine = base64::engine::general_purpose::STANDARD_NO_PAD;
+        let body = real_announce_body(&engine.encode(encrypted_key), &engine.encode(aes_iv));
+
+        let session = handle_announce(&body).unwrap();
+        assert_eq!(session.aes, Some((aes_key, aes_iv)));
     }
 
     /// A real iPhone was observed sending exactly this — an `ANNOUNCE` with neither
