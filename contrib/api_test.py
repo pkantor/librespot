@@ -28,7 +28,9 @@ What a client has to get right, all of which this script demonstrates:
   * `cover_available` says a picture is ready to be asked for — the moment to send `cover`
     if you want one. It is pushed to subscribers only.
   * nothing is retransmitted. If a chunk goes missing (the count doesn't add up, or a
-    chunk never arrives), ask `cover` again.
+    chunk never arrives), ask `cover` again. The server paces the chunks so a receive
+    buffer of any reasonable size keeps up, and re-encodes oversized artwork smaller,
+    so a picture that never completes means something worse than a busy client.
   * both sources look the same. `source` says `"spotify"` or `"airplay"`; the events and
     the track shape are identical, and fields that don't apply to a source are empty
     rather than missing.
@@ -53,7 +55,9 @@ KEEPALIVE_SECONDS = 10
 # Every datagram is small now that covers travel in chunks; this is roomy.
 RECV_BUFFER = 64 * 1024
 
-# Room for a whole cover's worth of chunks arriving back to back while this client is busy.
+# Room for a burst of chunks arriving while this client is busy elsewhere. Ask for a lot,
+# but don't count on getting it: Linux silently clamps this to net.core.rmem_max, ~208 kB by
+# default, which is why the server paces the chunks rather than firing a whole cover at once.
 SOCKET_BUFFER = 1024 * 1024
 
 # A cover that never finishes arriving shouldn't be waited on forever.

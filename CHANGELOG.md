@@ -48,11 +48,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picture with `cover` instead. Carrying one made those responses larger than a datagram can be
   sent as (`Message too long`), which lost the whole response rather than just the picture.
   Freed of that limit, the cover fetched from Spotify is now the largest on offer rather than the
-  smallest one big enough to display, and a sender's own artwork is kept whole. (breaking)
+  smallest one big enough to display, and a sender's own artwork is kept as it arrived unless it
+  is large enough to need shrinking. (breaking)
 - [core] Made `SpotifyId::to_base62`, `SpotifyId::to_base16`, `FileId::to_base16`, `SpotifyUri::to_id`, `SpotifyUri::to_uri` infallible (breaking)
 
 ### Fixed
 
+- [api] Cover art from an AirPlay sender that pushes it at full size now arrives. iTunes on
+  Windows sends a 1.4 MB PNG, which `cover` split into ~460 datagrams fired back to back —
+  far more than a client's receive buffer holds, and since nothing is retransmitted, asking
+  again only lost the same race. Chunks now go out in paced bursts, and a picture over 256 kB
+  is re-encoded to at most 640 px of JPEG before it is held.
+- [api] `cover_chunk` datagrams are no longer IP-fragmented. A chunk was 3 kB of picture, which
+  with base64 and the JSON envelope made a ~4.2 kB datagram — nearly three times the 1472 bytes
+  an Ethernet or Wi-Fi MTU leaves for a UDP payload, so the kernel split every one of them into
+  three fragments and any fragment lost took the whole chunk with it. A chunk is now sized from
+  that budget instead — 1032 bytes — so the datagram crosses a link in one piece.
+- [airplay] The mDNS advertisement is registered with the standard 75-minute TTL real receivers
+  use, rather than libmdns's one-minute default. libmdns announces only once, so the receiver's
+  visibility depended on every refresh answer inside each minute arriving. This did **not** on
+  its own stop the receiver disappearing from a sender's list — only the `airplay-dns-sd`
+  backend did, which points at libmdns rather than at the TTL.
 - [api] A source that goes away no longer leaves its last track on display: the reported track,
   cover and position are cleared when a Spotify Connect session disconnects or an AirPlay session
   ends, whichever of the two was the one playing. A client had no way to tell a finished session's

@@ -204,6 +204,10 @@ env_logger = { version = "0.11.2", default-features = false, features = [
 ] }
 futures-util = { version = "0.3", default-features = false }
 getopts = "0.2"
+# Only to shrink oversized cover art before the API ships it (`src/server.rs`): an AirPlay sender
+# can push megabytes of PNG, which no number of datagrams gets across intact. Decoders for the two
+# formats senders actually use, and the JPEG encoder — nothing else.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 log = "0.4"
 sha1 = "0.10"
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }

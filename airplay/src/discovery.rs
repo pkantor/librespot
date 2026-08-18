@@ -43,6 +43,34 @@ use crate::device_id::DeviceId;
 
 const RAOP_SERVICE_TYPE: &str = "_raop._tcp";
 
+/// How long a sender may cache this advertisement, in seconds — Apple's own value for
+/// PTR/SRV/TXT (mDNSResponder's `kStandardTTL`, 75 minutes), which is what every real receiver on
+/// the network hands out.
+///
+/// Not a tuning knob: `libmdns::Responder::register` defaults to `libmdns::DEFAULT_TTL`, **60
+/// seconds**, and libmdns announces exactly once at registration with nothing periodic after
+/// (`send_unsolicited` is called only from `register_with_ttl` and from unregister). The
+/// advertisement therefore survives in a sender's list only for as long as that sender keeps
+/// re-querying *and* every one of those answers arrives — one lost response inside a one-minute
+/// window and the device vanishes from the list while the receiver is still running and still
+/// answering. Confirmed on the wire: a `dns-sd -B _raop._tcp` browse logged `Rmv` exactly
+/// 60.000s after `Add`.
+///
+/// This governs PTR/SRV/TXT only — the records whose expiry removes the *service* from a browse
+/// list. libmdns hardcodes `DEFAULT_TTL` for the A/AAAA answers it sends in reply to
+/// queries (`fsm.rs`'s `add_ip_rr` call sites), so this receiver's address record still refreshes
+/// on the minute regardless. That matches Apple, which likewise gives address records a short TTL
+/// (120s) and the service records the long one.
+///
+/// A long TTL leaves a stale entry behind only after an *ungraceful* exit: dropping the
+/// registration sends the RFC 6762 §10.1 goodbye (libmdns re-announces with TTL 0), so a clean
+/// shutdown still removes the device from every list immediately.
+///
+/// Only the `libmdns` path has a TTL to set; the system daemon behind the `dns-sd` path picks
+/// this same standard value itself, so the constant is `cfg`'d out with the code that reads it.
+#[cfg(not(feature = "dns-sd"))]
+const SERVICE_TTL_SECS: u32 = 4500;
+
 /// This crate's own version, for `fv` — the *firmware* version, which shairport-sync likewise
 /// fills with its own package version (`config.firmware_version`). A sender treats it as
 /// descriptive.
@@ -173,7 +201,16 @@ pub(crate) fn advertise(
         let txt = legacy_raop_txt_record();
         let txt_refs: Vec<&str> = txt.iter().map(String::as_str).collect();
         let name = raop_service_name(&device_id, &name);
-        let _service = responder.register(RAOP_SERVICE_TYPE, &name, port, &txt_refs);
+        // `register_with_ttl` rather than `register`: the default TTL is a minute — see
+        // `SERVICE_TTL_SECS`. The `dns-sd` path above needs no equivalent; the system daemon
+        // picks the same standard TTL itself.
+        let _service = responder.register_with_ttl(
+            RAOP_SERVICE_TYPE,
+            &name,
+            port,
+            &txt_refs,
+            SERVICE_TTL_SECS,
+        );
 
         let _ = shutdown_rx.blocking_recv();
     });

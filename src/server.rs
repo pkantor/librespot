@@ -64,19 +64,32 @@
 //! which is an answer rather than silence. Nothing is retransmitted: a client that misses a chunk
 //! asks again.
 //!
-//! Because the picture no longer rides along with anything, its size stopped being a design
-//! constraint. Spotify's *largest* cover is fetched rather than the smallest one big enough to
-//! display, and a sender's own artwork is kept whole. `cover_available` tells subscribers a
-//! picture can be asked for, so nobody has to poll.
+//! Because nothing is retransmitted, the size of a picture decides whether it arrives at all, and
+//! two things keep that in hand. The chunks go out in paced bursts ([`COVER_BURST_PAUSE`]) instead
+//! of one tight loop, which is what a client's receive buffer — tens of datagrams, not hundreds —
+//! can actually take in; and a picture over [`COVER_SHRINK_ABOVE_BYTES`] is re-encoded smaller
+//! ([`shrink_cover`]) before it is ever held. Both were learned from iTunes on Windows, which
+//! pushes its artwork at full size: 1.4 MB of PNG became ~460 datagrams fired back to back, the
+//! client's buffer overran every time, and the cover never appeared no matter how often it asked.
+//!
+//! A chunk is also sized so the datagram carrying it crosses a link in one packet
+//! ([`MTU_UDP_PAYLOAD`]) rather than as IP fragments. That is not what decides whether a picture
+//! arrives — the packet count is much the same either way — but fragments bring failure modes of
+//! their own, and none of them are worth carrying. See [`COVER_CHUNK_BYTES`].
+//!
+//! Within that, size is not otherwise a design constraint. Spotify's *largest* cover is fetched
+//! rather than the smallest one big enough to display, and anything already small enough is kept
+//! byte for byte as it arrived. `cover_available` tells subscribers a picture can be asked for, so
+//! nobody has to poll.
 //!
 //! Urls are still not reported at all: the clients here cannot reach the internet, only the Pi
 //! can. A cover is fetched once per track no matter how many clients are listening, and the last
 //! few are cached, so skipping back and forth doesn't refetch.
 //!
-//! With no datagram exceeding a few kilobytes, none of this depends on IP fragmentation any more,
-//! and a modest receive buffer is enough — 64 kB is plenty. The platform difference that used to
-//! matter (macOS caps outgoing datagrams at `net.inet.udp.maxdgram`, 9216 by default, while Linux
-//! allows 65507) no longer affects anything this server sends.
+//! No datagram this server sends exceeds one MTU, so nothing here depends on IP fragmentation and
+//! a modest receive buffer is enough — 64 kB per read is plenty. The platform difference that used
+//! to matter (macOS caps outgoing datagrams at `net.inet.udp.maxdgram`, 9216 by default, while
+//! Linux allows 65507) is far above anything sent now and no longer affects this server.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -113,15 +126,72 @@ pub const SUBSCRIPTION_LEASE: Duration = Duration::from_secs(30);
 /// payload. Answers are not bound by this — one carrying a cover runs to tens of kB.
 const MAX_DATAGRAM_SIZE: usize = 1024;
 
-/// Raw bytes per `cover` chunk. Base64 grows this by a third, so a chunk plus its JSON envelope
-/// stays comfortably inside a small datagram — well under the 9216-byte cap macOS puts on one
-/// (`net.inet.udp.maxdgram`) and nowhere near needing IP fragmentation on any platform.
-const COVER_CHUNK_BYTES: usize = 3 * 1024;
+/// Raw bytes per `cover` chunk: as much picture as fits in one Ethernet frame once base64 has
+/// grown it by a third and [`COVER_CHUNK_ENVELOPE_BYTES`] of JSON is wrapped around it.
+///
+/// Derived rather than picked, so the two cannot drift apart; `chunk_datagrams_fit_one_frame`
+/// checks the envelope estimate the derivation rests on.
+///
+/// This does not make a picture likelier to arrive on its own: base64 and the envelope cost the
+/// same fraction whatever the split, so a given cover takes about the same number of *packets*
+/// either way, and a client re-asks for the whole picture on any loss regardless. What it removes
+/// is IP fragmentation, which at the previous 3 kB turned every chunk into three fragments and
+/// brought its own ways to fail — reassembly-queue pressure on the receiver with hundreds of
+/// datagrams in flight, consumer routers and tunnels that drop fragments outright, and a receive
+/// buffer that holds far fewer datagrams because each costs three buffers' worth of accounting.
+///
+/// (Not to be confused with the 9216-byte cap macOS puts on a datagram handed to `sendto`,
+/// `net.inet.udp.maxdgram`. That bounds what the local stack accepts; it says nothing about what
+/// crosses the network in one piece.)
+const COVER_CHUNK_BYTES: usize = ((MTU_UDP_PAYLOAD - COVER_CHUNK_ENVELOPE_BYTES) / 4) * 3;
 
-/// A cover past this is refused rather than sent. Nothing legitimate approaches it — a sender's
-/// own artwork runs to a couple of hundred kilobytes — so this is a bound on damage, not a
-/// quality decision.
+/// What [`Event::CoverChunk`]'s JSON costs around the base64 at its worst: the longest mime
+/// [`cover_mime`] reports, and four digits each of `index` and `count` (a cover of
+/// [`MAX_COVER_BYTES`] does not reach five). Only used to size [`COVER_CHUNK_BYTES`], and only
+/// right as long as the event's shape is — which is what `chunk_datagrams_fit_one_frame` checks.
+const COVER_CHUNK_ENVELOPE_BYTES: usize = 93;
+
+/// What a UDP payload has to stay inside to cross an Ethernet or Wi-Fi link as one packet: 1500
+/// bytes of MTU less 20 of IP header and 8 of UDP header. Past this the kernel splits the datagram
+/// into IP fragments, and losing any one of them loses the whole datagram — see
+/// [`COVER_CHUNK_BYTES`].
+const MTU_UDP_PAYLOAD: usize = 1472;
+
+/// How many chunks go out back to back before the send pauses to let the client catch up.
+///
+/// Nothing here retransmits, so a chunk the client's socket buffer had no room for is a chunk the
+/// picture never gets. See [`COVER_BURST_PAUSE`].
+const COVER_CHUNK_BURST: usize = 8;
+
+/// How long the `cover` answer pauses between bursts of [`COVER_CHUNK_BURST`] chunks.
+///
+/// A receive buffer holds tens of datagrams, not hundreds: Linux clamps whatever a client asks for
+/// to `net.core.rmem_max`, ~208 kB by default. Firing a whole picture's worth of chunks in one
+/// tight loop overruns that before the client can drain it, and since nothing is retransmitted the
+/// client re-asks and loses the same race again — a cover that never arrives, no matter how often
+/// it is requested. Eight chunks per millisecond is far below what a client drains and still puts
+/// even the largest picture on the wire in well under a second.
+const COVER_BURST_PAUSE: Duration = Duration::from_millis(1);
+
+/// A cover past this is refused rather than sent. This is the bound on what is *accepted*, before
+/// [`shrink_cover`] cuts it down — a sender that pushes more than a couple of megabytes of artwork
+/// is malfunctioning, not being generous.
 pub const MAX_COVER_BYTES: usize = 2 * 1024 * 1024;
+
+/// Above this, a cover is re-encoded smaller before it is held. Below it, the bytes are kept
+/// exactly as they arrived.
+///
+/// Spotify's largest cover sits far under this, so that path never re-encodes. AirPlay senders are
+/// the reason this exists: iTunes on Windows pushes the artwork at full size — 1.4 MB of PNG
+/// observed — which is twenty times more picture than a client on this LAN displays.
+const COVER_SHRINK_ABOVE_BYTES: usize = 256 * 1024;
+
+/// The longest edge a re-encoded cover is scaled down to. Not scaled *up*: a picture already
+/// smaller than this only gets re-encoded, never stretched.
+const COVER_MAX_EDGE: u32 = 640;
+
+/// JPEG quality a re-encoded cover is written at.
+const COVER_JPEG_QUALITY: u8 = 85;
 
 /// How long a cover fetch may take before the track event goes out without it.
 const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -294,11 +364,13 @@ enum ApiServerCommand {
     },
 }
 
-/// A cover fetched off the loop, on its way back to the task that asked for it.
+/// A cover prepared off the loop, on its way back to the task that asked for it.
 struct CoverFetched {
-    /// The url it was fetched from, which is what the cache and the pending track key on.
-    url: String,
-    /// `None` when it could not be fetched; the track then goes out without a cover.
+    /// The url it was fetched from, which is what the cache keys on. `None` for a cover that came
+    /// from an AirPlay sender: it was pushed rather than fetched, so there is nothing to key on and
+    /// nothing to re-fetch later.
+    url: Option<String>,
+    /// `None` when it could not be produced; the track then simply has no picture to ask for.
     cover: Option<Cover>,
 }
 
@@ -572,6 +644,87 @@ fn cover_mime(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// Cuts an oversized cover down to something a client can actually receive, leaving anything
+/// already small enough exactly as it arrived.
+///
+/// The `cover` command splits a picture into datagrams and retransmits none of them, so the size
+/// of the picture decides whether it arrives at all — see [`COVER_BURST_PAUSE`]. Pacing keeps a
+/// reasonable picture intact; a 1.4 MB PNG is not a reasonable picture, and shrinking it is the
+/// only thing that makes it deliverable rather than merely slower to lose.
+///
+/// Anything that goes wrong — a format neither decoder handles, a corrupt body, a failed encode —
+/// keeps the original bytes. A big cover the client may fail to reassemble beats no cover.
+///
+/// CPU-bound, and slow enough on a Pi to matter: call it off the server task's loop.
+fn shrink_cover(cover: Cover) -> Cover {
+    if cover.bytes.len() <= COVER_SHRINK_ABOVE_BYTES {
+        return cover;
+    }
+
+    let image = match image::load_from_memory(&cover.bytes) {
+        Ok(image) => image,
+        Err(e) => {
+            warn!(
+                "could not decode the {}-byte {} cover to shrink it: {e}",
+                cover.bytes.len(),
+                cover.mime
+            );
+            return cover;
+        }
+    };
+
+    // `resize` fits inside the bounds and would happily scale a smaller picture up; a cover this
+    // big because of how it was encoded rather than how large it is only needs the re-encode.
+    let image = if image.width() > COVER_MAX_EDGE || image.height() > COVER_MAX_EDGE {
+        image.resize(
+            COVER_MAX_EDGE,
+            COVER_MAX_EDGE,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+
+    let mut bytes = Vec::new();
+    let encoded =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, COVER_JPEG_QUALITY)
+            .encode_image(&image.to_rgb8());
+
+    if let Err(e) = encoded {
+        warn!("could not re-encode the cover: {e}");
+        return cover;
+    }
+
+    debug!(
+        "shrank a {}-byte {} cover to {} bytes of JPEG, {}x{}",
+        cover.bytes.len(),
+        cover.mime,
+        bytes.len(),
+        image.width(),
+        image.height()
+    );
+
+    Cover {
+        bytes,
+        mime: "image/jpeg",
+    }
+}
+
+/// [`shrink_cover`] on a blocking thread, since decoding and re-encoding a megabyte of PNG takes
+/// long enough on a Pi to be worth keeping off an async worker.
+///
+/// `None` only when the blocking thread itself failed, which takes the cover with it — the picture
+/// is then simply absent, the same as any other cover that could not be produced.
+async fn shrink_cover_off_thread(cover: Cover) -> Option<Cover> {
+    match tokio::task::spawn_blocking(move || shrink_cover(cover)).await {
+        Ok(cover) => Some(cover),
+        Err(e) => {
+            warn!("shrinking the cover failed: {e}");
+            None
+        }
+    }
+}
+
 /// Fetches a cover and hands it back to the server task.
 ///
 /// Runs off the task's loop, which has to keep answering commands meanwhile. Always reports back,
@@ -588,10 +741,11 @@ async fn fetch_cover(session: Session, url: String, cover_tx: mpsc::UnboundedSen
         Ok(Ok(bytes)) => {
             debug!("fetched {} bytes of cover from {url}", bytes.len());
 
-            Some(Cover {
+            shrink_cover_off_thread(Cover {
                 mime: cover_mime(&bytes),
                 bytes: bytes.to_vec(),
             })
+            .await
         }
         Ok(Err(e)) => {
             warn!("could not fetch the cover {url}: {e}");
@@ -604,7 +758,10 @@ async fn fetch_cover(session: Session, url: String, cover_tx: mpsc::UnboundedSen
     };
 
     // the receiver lives as long as the server task, which is what spawned this
-    let _ = cover_tx.send(CoverFetched { url, cover });
+    let _ = cover_tx.send(CoverFetched {
+        url: Some(url),
+        cover,
+    });
 }
 
 /// The last few covers, so that skipping back and forth doesn't refetch them.
@@ -1058,7 +1215,7 @@ impl ApiServerTask {
                 // The DACP path fetches the picture before reporting the track, so it arrives
                 // here; the push path sends it as its own request moments later.
                 if let Some((bytes, mime)) = cover {
-                    self.announce_cover(Cover { bytes, mime }).await;
+                    self.load_airplay_cover(Cover { bytes, mime }).await;
                 }
             }
             AirplayEvent::CoverChanged {
@@ -1085,7 +1242,7 @@ impl ApiServerTask {
                     );
                     return;
                 }
-                self.announce_cover(Cover { bytes, mime }).await;
+                self.load_airplay_cover(Cover { bytes, mime }).await;
             }
             AirplayEvent::ProgressChanged {
                 connection,
@@ -1190,9 +1347,35 @@ impl ApiServerTask {
         let Some(cover) = fetched.cover else {
             return;
         };
-        self.covers.insert(fetched.url, cover.clone());
+        // an AirPlay sender's own artwork has no url to key on, and it pushes it again anyway
+        if let Some(url) = fetched.url {
+            self.covers.insert(url, cover.clone());
+        }
 
         self.announce_cover(cover).await;
+    }
+
+    /// Takes a cover an AirPlay sender pushed: held right away when it is small enough, shrunk
+    /// off the loop first when it isn't.
+    ///
+    /// Nothing was fetched here — the sender handed over the bytes — so this is where the size
+    /// decision happens for that path. A shrink reports back through the same channel
+    /// [`fetch_cover`] uses, carrying no url, since there is nothing to cache it under.
+    #[cfg(feature = "airplay")]
+    async fn load_airplay_cover(&mut self, cover: Cover) {
+        if cover.bytes.len() <= COVER_SHRINK_ABOVE_BYTES {
+            self.announce_cover(cover).await;
+            return;
+        }
+
+        let cover_tx = self.cover_tx.clone();
+
+        tokio::spawn(async move {
+            let cover = shrink_cover_off_thread(cover).await;
+
+            // the receiver lives as long as the server task, which is what spawned this
+            let _ = cover_tx.send(CoverFetched { url: None, cover });
+        });
     }
 
     /// Holds a cover for the current track and tells subscribers it can be asked for.
@@ -1210,6 +1393,9 @@ impl ApiServerTask {
     /// One response per chunk, in order, each carrying its index and the total — so a client can
     /// reassemble them and tell a lost one from the end of the picture. A track with no cover
     /// (yet) is answered with a single `count: 0`, which is a real answer rather than silence.
+    ///
+    /// Sent in bursts of [`COVER_CHUNK_BURST`] with a [`COVER_BURST_PAUSE`] between them, so the
+    /// client's receive buffer is never the reason a chunk goes missing.
     async fn send_cover(&self, peer: SocketAddr) {
         let Some(cover) = &self.current_cover else {
             self.reply(
@@ -1232,6 +1418,10 @@ impl ApiServerTask {
             chunks.len()
         );
         for (index, chunk) in chunks.iter().enumerate() {
+            if index > 0 && index % COVER_CHUNK_BURST == 0 {
+                tokio::time::sleep(COVER_BURST_PAUSE).await;
+            }
+
             self.reply(
                 &Event::CoverChunk {
                     mime: cover.mime,
@@ -1615,6 +1805,106 @@ mod tests {
         assert_eq!(cache.covers.len(), COVER_CACHE_SIZE);
     }
 
+    /// The chunk size is only right in relation to the envelope around it, and the envelope is
+    /// free to grow whenever [`Event::CoverChunk`] changes. Built at its worst: the longest mime
+    /// [`cover_mime`] can report, and the largest indices a cover of [`MAX_COVER_BYTES`] reaches.
+    #[test]
+    fn chunk_datagrams_fit_one_frame() {
+        let last = MAX_COVER_BYTES.div_ceil(COVER_CHUNK_BYTES);
+        let datagram = encode(&Event::CoverChunk {
+            mime: "application/octet-stream",
+            index: last,
+            count: last,
+            data: BASE64.encode(&vec![0xab; COVER_CHUNK_BYTES]),
+        })
+        .expect("encodes");
+
+        assert!(
+            datagram.len() <= MTU_UDP_PAYLOAD,
+            "a chunk datagram is {} bytes and would be fragmented",
+            datagram.len()
+        );
+    }
+
+    /// A PNG of noise, which barely compresses — the point is to get past
+    /// [`COVER_SHRINK_ABOVE_BYTES`] the way a real sender's full-size artwork does.
+    fn noisy_png(edge: u32) -> Vec<u8> {
+        let pixels = image::RgbImage::from_fn(edge, edge, |x, y| {
+            let seed = x.wrapping_mul(2654435761) ^ y.wrapping_mul(2246822519);
+            image::Rgb([(seed >> 16) as u8, (seed >> 8) as u8, seed as u8])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encodes");
+
+        bytes
+    }
+
+    /// The picture iTunes on Windows pushes is megabytes of PNG, which no amount of pacing gets
+    /// across in one piece. It has to come down in size before it is ever held.
+    #[test]
+    fn an_oversized_cover_is_re_encoded_smaller() {
+        let bytes = noisy_png(1024);
+        assert!(
+            bytes.len() > COVER_SHRINK_ABOVE_BYTES,
+            "the fixture has to be oversized to test anything"
+        );
+
+        let before = bytes.len();
+        let shrunk = shrink_cover(Cover {
+            bytes,
+            mime: "image/png",
+        });
+
+        assert_eq!(shrunk.mime, "image/jpeg");
+        // What is guaranteed is the cap on the picture, not an absolute byte count: how far the
+        // bytes fall is up to the content, and noise is the worst case JPEG ever meets. Real
+        // artwork of this size comes out around 50 kB.
+        assert!(
+            shrunk.bytes.len() < before / 2,
+            "{before} bytes became {}",
+            shrunk.bytes.len()
+        );
+
+        let decoded = image::load_from_memory(&shrunk.bytes).expect("a readable JPEG");
+        assert_eq!(decoded.width(), COVER_MAX_EDGE);
+        assert_eq!(decoded.height(), COVER_MAX_EDGE);
+    }
+
+    /// Everything else is kept byte for byte: Spotify's covers arrive small already, and
+    /// re-encoding one would only cost quality.
+    #[test]
+    fn a_cover_small_enough_to_send_is_left_alone() {
+        let bytes = noisy_png(64);
+        assert!(bytes.len() <= COVER_SHRINK_ABOVE_BYTES);
+
+        let kept = shrink_cover(Cover {
+            bytes: bytes.clone(),
+            mime: "image/png",
+        });
+
+        assert_eq!(kept.mime, "image/png");
+        assert_eq!(kept.bytes, bytes);
+    }
+
+    /// A body no decoder makes sense of is passed through rather than dropped — a picture the
+    /// client may struggle with beats no picture.
+    #[test]
+    fn a_cover_that_cannot_be_decoded_survives_the_shrink() {
+        let bytes = vec![0x5a; COVER_SHRINK_ABOVE_BYTES + 1];
+
+        let kept = shrink_cover(Cover {
+            bytes: bytes.clone(),
+            mime: "application/octet-stream",
+        });
+
+        assert_eq!(kept.bytes, bytes);
+    }
+
     #[test]
     fn episode_response_falls_back_to_the_show_name() {
         let response = TrackResponse::from(audio_item(UniqueFields::Episode {
@@ -1912,7 +2202,9 @@ mod tests {
     /// each saying which of how many it is.
     #[tokio::test]
     async fn the_cover_command_answers_in_chunks() {
-        const SIZE: usize = COVER_CHUNK_BYTES * 2 + 100;
+        // spanning several bursts, so the pacing in `send_cover` is part of what this exercises
+        const CHUNKS: usize = COVER_CHUNK_BURST * 2 + 1;
+        const SIZE: usize = COVER_CHUNK_BYTES * (CHUNKS - 1) + 100;
 
         let server = TestServer::start_with(AllowList::default(), |task| {
             task.current_cover = Some(Cover {
@@ -1925,11 +2217,11 @@ mod tests {
         server.request("cover").await;
 
         let mut reassembled = Vec::new();
-        for expected_index in 0..3 {
+        for expected_index in 0..CHUNKS {
             let chunk = server.receive().await;
             assert_eq!(chunk["event"], "cover_chunk");
             assert_eq!(chunk["index"], expected_index);
-            assert_eq!(chunk["count"], 3);
+            assert_eq!(chunk["count"], CHUNKS);
             assert_eq!(chunk["mime"], "image/jpeg");
             reassembled.extend(
                 BASE64
