@@ -42,6 +42,8 @@ mod player_event_handler;
 use player_event_handler::{EventHandler, run_program_on_sink_events};
 
 mod server;
+#[cfg(feature = "airplay")]
+use server::DEFAULT_AIRPLAY_HELPER_PORT;
 use server::{AllowList, ApiServer, ApiServerConfig, DEFAULT_BIND_ADDR};
 
 fn device_id(name: &str) -> String {
@@ -304,6 +306,8 @@ async fn get_setup() -> Setup {
     const AIRPLAY_PORT: &str = "airplay-port";
     #[cfg(feature = "airplay")]
     const AIRPLAY_BIND_IP: &str = "airplay-bind-ip";
+    #[cfg(feature = "airplay")]
+    const AIRPLAY_HELPER_PORT: &str = "airplay-helper-port";
 
     // Mostly arbitrary.
     const AP_PORT_SHORT: &str = "a";
@@ -365,6 +369,8 @@ async fn get_setup() -> Setup {
     const AIRPLAY_PORT_SHORT: &str = ""; // no short flag
     #[cfg(feature = "airplay")]
     const AIRPLAY_BIND_IP_SHORT: &str = ""; // no short flag
+    #[cfg(feature = "airplay")]
+    const AIRPLAY_HELPER_PORT_SHORT: &str = ""; // no short flag
 
     // Options that have different descriptions
     // depending on what backends were enabled at build time.
@@ -729,6 +735,11 @@ async fn get_setup() -> Setup {
         AIRPLAY_BIND_IP,
         "Comma-separated interface IP addresses the AirPlay receiver advertises over mDNS. Defaults to all addresses on all interfaces, which on a multi-homed machine (VPNs, multiple adapters) can advertise an unreachable address alongside the real one and make the receiver invisible to real senders.",
         "IP"
+    ).optopt(
+        AIRPLAY_HELPER_PORT_SHORT,
+        AIRPLAY_HELPER_PORT,
+        "Port of the control helper (contrib/airplay-control-windows.ps1) on an AirPlay sender's own machine, used for next/pause/resume only when that sender offers no DACP endpoint — as Apple Music on Windows does. Defaults to 50506; 0 disables the fallback.",
+        "PORT"
     );
 
     let args: Vec<_> = std::env::args_os()
@@ -1916,9 +1927,32 @@ async fn get_setup() -> Setup {
             })
             .unwrap_or_default();
 
+        // `0` disables the fallback, the way a port of zero means "none" rather than a real port
+        // everywhere else.
+        #[cfg(feature = "airplay")]
+        let airplay_helper_port = opt_str(AIRPLAY_HELPER_PORT)
+            .map(|port| {
+                port.parse::<u16>().unwrap_or_else(|_| {
+                    invalid_error_msg(
+                        AIRPLAY_HELPER_PORT,
+                        AIRPLAY_HELPER_PORT_SHORT,
+                        &port,
+                        "a valid port number, or 0 to disable",
+                        "",
+                    );
+
+                    exit(1);
+                })
+            })
+            .map_or(Some(DEFAULT_AIRPLAY_HELPER_PORT), |port| {
+                (port != 0).then_some(port)
+            });
+
         ApiServerConfig {
             bind_addr,
             allow_list,
+            #[cfg(feature = "airplay")]
+            airplay_helper_port,
         }
     };
 

@@ -94,8 +94,15 @@ pub(crate) async fn serve_connection(
     // A sender's DACP server is at its RTSP peer address; only the port needs resolving. Kept
     // whole rather than as an `IpAddr` because an IPv6 peer's scope id is part of reaching it
     // back (`dacp::DacpTarget::scope_id`).
-    #[cfg_attr(not(feature = "remote-control"), allow(unused_variables))]
     let peer_addr = stream.peer_addr().ok();
+    // Announced before anything is parsed: this is the only address a sender that never resolves
+    // a DACP port ever offers, and the fork's UDP API routes on it (`AirplayEvent::SessionStarted`).
+    if let Some(peer) = peer_addr {
+        let _ = airplay_events.send(AirplayEvent::SessionStarted {
+            connection,
+            peer: peer.ip(),
+        });
+    }
 
     let local_ip = stream
         .local_addr()

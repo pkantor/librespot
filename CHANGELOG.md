@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the phone that was streaming rather than an idle Spotify session.
 - [api] `cover` command, answering with the current cover art split across as many `cover_chunk`
   datagrams as it takes, and a `cover_available` event announcing that there is one to ask for.
+- [api] `--airplay-helper-port`: `next`/`pause`/`resume` for an AirPlay sender that offers no DACP
+  endpoint are forwarded to a helper on that sender's own machine, at the address its RTSP
+  connection came from. Apple Music on Windows sends `DACP-ID`/`Active-Remote` but never resolves
+  an `iTunes_Ctrl_…._dacp._tcp` advertisement, so until now those commands had nowhere to go and
+  were dropped. DACP is still tried first; the fallback only covers senders it cannot reach.
+  `contrib/airplay-control-windows.ps1` is such a helper. Defaults to port 50506, `0` disables it.
+- [airplay] `AirplayEvent::SessionStarted`, carrying the address a sender connected from. Unlike
+  `DacpAvailable` it needs no mDNS resolve, so it arrives for every sender. (breaking)
 - [connect] Add method `add_to_queue` to `Spirc` to add tracks, episodes, albums and playlists to the queue
 - [playback] Add `SetQueue` player event, emitting when the queue changes (context loaded, track added to queue, or queue set via Spotify Connect). Gated behind `ConnectConfig::emit_set_queue_events`
 

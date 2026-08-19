@@ -201,6 +201,16 @@ const COVER_CACHE_SIZE: usize = 4;
 
 const SPOTIFY_ITEM_TYPE_TRACK: &str = "track";
 
+/// Default port of the per-sender control helper (`contrib/airplay-control-windows.ps1`), one
+/// above the API's own so the pair reads as a pair.
+///
+/// The fallback exists because a sender can send `DACP-ID`/`Active-Remote` and still never
+/// resolve: Apple Music on Windows does exactly that, leaving `dacp::resolve_port` to time out
+/// and `next`/`pause`/`resume` with nowhere to go. A helper on the sender's own machine can
+/// always control it locally, whatever mDNS does.
+#[cfg(feature = "airplay")]
+pub const DEFAULT_AIRPLAY_HELPER_PORT: u16 = 50506;
+
 #[derive(Debug, ThisError)]
 pub enum ApiServerError {
     #[error("could not bind the API server to {addr}: {source}")]
@@ -216,6 +226,11 @@ pub enum ApiServerError {
 pub struct ApiServerConfig {
     pub bind_addr: String,
     pub allow_list: AllowList,
+    /// Port of the control helper on an AirPlay sender's own machine, used only when that sender
+    /// offers no DACP endpoint — see [`ApiServerTask::control`]. `None` disables the fallback, so
+    /// such a sender simply stays uncontrollable.
+    #[cfg(feature = "airplay")]
+    pub airplay_helper_port: Option<u16>,
 }
 
 impl Default for ApiServerConfig {
@@ -223,6 +238,8 @@ impl Default for ApiServerConfig {
         Self {
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             allow_list: AllowList::default(),
+            #[cfg(feature = "airplay")]
+            airplay_helper_port: Some(DEFAULT_AIRPLAY_HELPER_PORT),
         }
     }
 }
@@ -416,6 +433,17 @@ impl ApiServer {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (cover_tx, cover_rx) = mpsc::unbounded_channel();
 
+        // An ephemeral port is all this needs, and failing to get one only costs the fallback —
+        // not a reason to refuse to start the API.
+        #[cfg(feature = "airplay")]
+        let helper_socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => Some(socket),
+            Err(e) => {
+                warn!("could not bind a socket for the AirPlay control helper: {e}");
+                None
+            }
+        };
+
         let task = tokio::spawn(
             ApiServerTask {
                 socket,
@@ -440,6 +468,12 @@ impl ApiServer {
                 airplay_dacp: None,
                 #[cfg(feature = "airplay")]
                 airplay_connection: None,
+                #[cfg(feature = "airplay")]
+                airplay_peer: None,
+                #[cfg(feature = "airplay")]
+                airplay_helper_port: config.airplay_helper_port,
+                #[cfg(feature = "airplay")]
+                helper_socket,
                 #[cfg(feature = "airplay")]
                 airplay_control: None,
             }
@@ -913,6 +947,25 @@ struct ApiServerTask {
     /// active source without ever offering remote control.
     #[cfg(feature = "airplay")]
     airplay_connection: Option<u64>,
+    /// The address the active AirPlay session's sender connected from, and which connection it
+    /// belongs to. Known from the RTSP connection itself, so — unlike `airplay_dacp` — it is there
+    /// for every sender, including the ones whose DACP port never resolves. Kept after the session
+    /// ends for the same reason `airplay_dacp` is: a stopped sender is still what `resume` has to
+    /// reach.
+    #[cfg(feature = "airplay")]
+    airplay_peer: Option<(u64, IpAddr)>,
+    /// Where the helper listens on that address; `None` disables the fallback entirely.
+    #[cfg(feature = "airplay")]
+    airplay_helper_port: Option<u16>,
+    /// A socket of its own for talking to the helper, rather than the API's.
+    ///
+    /// Not tidiness: a helper answers what it is sent, and anything arriving on `socket` is parsed
+    /// as a command — so forwarding from there fed the helper's `ok` straight back into
+    /// `handle_request`, which logged it and warned about an unknown command. Sending from a
+    /// separate socket makes that structurally impossible instead of relying on the far end
+    /// staying silent. Nothing ever reads this socket; the replies are meant to be dropped.
+    #[cfg(feature = "airplay")]
+    helper_socket: Option<UdpSocket>,
     /// Set alongside `airplay_events`. What `setvol` acts on while AirPlay is the source: an
     /// AirPlay 2 sender offers no way to be told to change *its* volume that this crate can reach
     /// (no `Active-Remote`/`DACP-ID` headers on that path), so the volume a client sets is this
@@ -1125,6 +1178,13 @@ impl ApiServerTask {
     #[cfg(feature = "airplay")]
     async fn handle_airplay_event(&mut self, event: AirplayEvent) {
         match event {
+            AirplayEvent::SessionStarted { connection, peer } => {
+                // Stored for every connection, not just the one on the air: the address has to be
+                // known *before* anything plays, since the first command may well be the one that
+                // starts it. Whoever connected last wins, matching `airplay_dacp`.
+                debug!("AirPlay connection {connection} is from {peer}");
+                self.airplay_peer = Some((connection, peer));
+            }
             #[cfg(feature = "airplay-remote-control")]
             AirplayEvent::DacpAvailable {
                 connection,
@@ -1472,17 +1532,20 @@ impl ApiServerTask {
         }
 
         match command {
-            "next" => self.control(command, Spirc::next, "nextitem"),
-            "pause" => self.control(command, Spirc::pause, "pause"),
-            "resume" => self.control(
-                command,
-                |spirc| {
-                    // the device may be idle, so take over playback before resuming
-                    spirc.activate()?;
-                    spirc.play()
-                },
-                "play",
-            ),
+            "next" => self.control(command, Spirc::next, "nextitem").await,
+            "pause" => self.control(command, Spirc::pause, "pause").await,
+            "resume" => {
+                self.control(
+                    command,
+                    |spirc| {
+                        // the device may be idle, so take over playback before resuming
+                        spirc.activate()?;
+                        spirc.play()
+                    },
+                    "play",
+                )
+                .await
+            }
             "volup" => self.command(command, Spirc::volume_up),
             "voldown" => self.command(command, Spirc::volume_down),
             "setvol" => match serde_json::from_str::<SetVolumeRequest>(payload) {
@@ -1544,11 +1607,16 @@ impl ApiServerTask {
         }
     }
 
-    /// Routes a transport command to whichever source is active: Spotify via `spirc`, AirPlay
-    /// via a DACP command sent fire-and-forget on its own task — a spirc call is local, a DACP
-    /// command is a network round trip.
+    /// Routes a transport command to whichever source is active: Spotify via `spirc`, AirPlay via
+    /// DACP, and — for a sender that offers no DACP endpoint — via the helper on that sender's own
+    /// machine (see [`Self::forward_to_helper`]).
+    ///
+    /// DACP first, always: it is the sender's own protocol and needs nothing installed at the far
+    /// end. The helper is the fallback for senders that never resolve one, not an alternative to
+    /// be preferred. A spirc call is local; both AirPlay routes are network sends, so both go out
+    /// fire-and-forget.
     #[cfg_attr(not(feature = "airplay-remote-control"), allow(unused_variables))]
-    fn control(
+    async fn control(
         &self,
         name: &str,
         spotify: impl FnOnce(&Spirc) -> Result<(), Error>,
@@ -1557,16 +1625,24 @@ impl ApiServerTask {
         #[cfg(feature = "airplay")]
         if self.active_source == Source::Airplay {
             #[cfg(feature = "airplay-remote-control")]
-            match self.airplay_dacp.clone().map(|(_, target)| target) {
-                Some(target) => {
-                    tokio::spawn(async move {
-                        librespot::airplay::dacp::send_command(&target, airplay_command).await;
-                    });
-                }
-                None => warn!(
-                    "cannot handle `{name}`: AirPlay is the active source but no DACP endpoint is known yet"
-                ),
+            if let Some(target) = self.airplay_dacp.clone().map(|(_, target)| target) {
+                tokio::spawn(async move {
+                    librespot::airplay::dacp::send_command(&target, airplay_command).await;
+                });
+                return;
             }
+
+            // The command name is forwarded verbatim: the helper speaks this same vocabulary, so
+            // there is nothing to translate — unlike DACP, whose `nextitem`/`play` differ.
+            if self.forward_to_helper(name).await {
+                return;
+            }
+
+            #[cfg(feature = "airplay-remote-control")]
+            warn!(
+                "cannot handle `{name}`: AirPlay is the active source but no DACP endpoint resolved \
+                 and no helper is configured or its sender's address is unknown"
+            );
             #[cfg(not(feature = "airplay-remote-control"))]
             warn!(
                 "cannot handle `{name}`: AirPlay is the active source but remote control isn't compiled in"
@@ -1575,6 +1651,38 @@ impl ApiServerTask {
         }
 
         self.command(name, spotify);
+    }
+
+    /// Sends a command to the control helper on the AirPlay sender's own machine, which can reach
+    /// the player locally whatever mDNS does.
+    ///
+    /// `false` when there is nothing to send to — no helper port configured, no sender address
+    /// seen yet, or no socket to send from — which leaves the caller to report the command as
+    /// unhandled. A `true` only means the datagram left: the helper's reply lands on
+    /// [`Self::helper_socket`], which nothing reads, and nothing here waits for one.
+    #[cfg(feature = "airplay")]
+    async fn forward_to_helper(&self, command: &str) -> bool {
+        let (Some(port), Some((_, peer)), Some(socket)) = (
+            self.airplay_helper_port,
+            self.airplay_peer,
+            self.helper_socket.as_ref(),
+        ) else {
+            return false;
+        };
+
+        let target = SocketAddr::new(peer, port);
+        match socket.send_to(command.as_bytes(), target).await {
+            Ok(_) => {
+                info!("forwarded `{command}` to the AirPlay control helper at {target}");
+                true
+            }
+            Err(e) => {
+                warn!("could not forward `{command}` to the helper at {target}: {e}");
+                // The route existed and was tried; reporting it as absent would only produce a
+                // second, misleading warning about there being nowhere to send.
+                true
+            }
+        }
     }
 
     /// `setvol`, routed like [`Self::control`] routes transport commands — a second body rather
@@ -2100,6 +2208,12 @@ mod tests {
             #[cfg(feature = "airplay")]
             airplay_connection: None,
             #[cfg(feature = "airplay")]
+            airplay_peer: None,
+            #[cfg(feature = "airplay")]
+            airplay_helper_port: None,
+            #[cfg(feature = "airplay")]
+            helper_socket: Some(UdpSocket::bind("127.0.0.1:0").await.expect("binds")),
+            #[cfg(feature = "airplay")]
             airplay_control: None,
         };
 
@@ -2593,6 +2707,183 @@ mod tests {
         assert!(
             task.airplay_dacp.is_some(),
             "the sender is still reachable, and telling it to play is the only way back"
+        );
+    }
+
+    /// The whole point of the helper fallback: a sender that sends `DACP-ID`/`Active-Remote` but
+    /// whose `_dacp._tcp` never resolves (Apple Music on Windows) produces no `DacpAvailable`, so
+    /// before this the command had nowhere to go. Its address is known regardless, from the RTSP
+    /// connection itself.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn a_sender_without_dacp_is_controlled_through_the_helper() {
+        let helper = UdpSocket::bind("127.0.0.1:0").await.expect("binds");
+        let helper_addr = helper.local_addr().expect("has an address");
+
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        task.airplay_helper_port = Some(helper_addr.port());
+
+        task.handle_airplay_event(AirplayEvent::SessionStarted {
+            connection: 1,
+            peer: helper_addr.ip(),
+        })
+        .await;
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+
+        // No `DacpAvailable` ever arrives, which is exactly the case under test.
+        task.control("pause", Spirc::pause, "pause").await;
+
+        let mut buf = [0u8; 64];
+        let (len, _) = timeout(Duration::from_secs(1), helper.recv_from(&mut buf))
+            .await
+            .expect("the helper was sent something")
+            .expect("received it");
+
+        // The API's own command name, not DACP's — the helper speaks this vocabulary.
+        assert_eq!(&buf[..len], b"pause");
+    }
+
+    /// Regression test for a real bug: forwarding used to go out on the API's own socket, so the
+    /// helper's `ok` came back to the port `handle_request` reads and was parsed as a command —
+    /// "received 'ok'" followed by "unknown command 'ok'" in the log, once per keypress. The
+    /// forwarding socket must be a different one.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn a_helpers_reply_does_not_come_back_as_a_command() {
+        let helper = UdpSocket::bind("127.0.0.1:0").await.expect("binds");
+        let helper_addr = helper.local_addr().expect("has an address");
+
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        task.airplay_helper_port = Some(helper_addr.port());
+        let api_addr = task.socket.local_addr().expect("has an address");
+
+        task.handle_airplay_event(AirplayEvent::SessionStarted {
+            connection: 1,
+            peer: helper_addr.ip(),
+        })
+        .await;
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+
+        task.control("pause", Spirc::pause, "pause").await;
+
+        // The helper answers whoever asked, as any reasonable one does.
+        let mut buf = [0u8; 64];
+        let (_, from) = timeout(Duration::from_secs(1), helper.recv_from(&mut buf))
+            .await
+            .expect("the helper was sent something")
+            .expect("received it");
+        helper.send_to(b"ok", from).await.expect("answers");
+
+        assert_ne!(
+            from, api_addr,
+            "the forward must not come from the port commands are read on"
+        );
+
+        // Nothing may be waiting on the API socket: an answer arriving there would be parsed as a
+        // command by the next `handle_request`.
+        let mut unexpected = [0u8; 64];
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                task.socket.recv_from(&mut unexpected)
+            )
+            .await
+            .is_err(),
+            "the helper's reply reached the command socket: {:?}",
+            String::from_utf8_lossy(&unexpected)
+        );
+    }
+
+    /// DACP is the sender's own protocol and needs nothing installed at the far end, so it stays
+    /// the first choice; the helper must not steal commands from a sender that resolved one.
+    #[cfg(feature = "airplay-remote-control")]
+    #[tokio::test]
+    async fn a_resolved_dacp_endpoint_wins_over_the_helper() {
+        let helper = UdpSocket::bind("127.0.0.1:0").await.expect("binds");
+        let helper_addr = helper.local_addr().expect("has an address");
+
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        task.airplay_helper_port = Some(helper_addr.port());
+
+        task.handle_airplay_event(AirplayEvent::SessionStarted {
+            connection: 1,
+            peer: helper_addr.ip(),
+        })
+        .await;
+        task.handle_airplay_event(AirplayEvent::DacpAvailable {
+            connection: 1,
+            host: "127.0.0.1".parse().expect("parses"),
+            port: 3689,
+            active_remote: "1234567890".to_string(),
+            machine_number: 0,
+            scope_id: 0,
+            local_bind: None,
+        })
+        .await;
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+
+        task.control("pause", Spirc::pause, "pause").await;
+
+        let mut buf = [0u8; 64];
+        assert!(
+            timeout(Duration::from_millis(200), helper.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the command belonged to DACP, so nothing should have reached the helper"
+        );
+    }
+
+    /// Spotify keeps its own route: the fallback is for AirPlay only, and a sender's address
+    /// lingering from an earlier session must not divert a Spotify command.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn the_helper_is_not_used_while_spotify_is_the_source() {
+        let helper = UdpSocket::bind("127.0.0.1:0").await.expect("binds");
+        let helper_addr = helper.local_addr().expect("has an address");
+
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        task.airplay_helper_port = Some(helper_addr.port());
+
+        task.handle_airplay_event(AirplayEvent::SessionStarted {
+            connection: 1,
+            peer: helper_addr.ip(),
+        })
+        .await;
+        assert_eq!(
+            task.active_source,
+            Source::Spotify,
+            "nothing has played yet"
+        );
+
+        task.control("pause", Spirc::pause, "pause").await;
+
+        let mut buf = [0u8; 64];
+        assert!(
+            timeout(Duration::from_millis(200), helper.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "Spotify is the source, so the helper is not involved"
+        );
+    }
+
+    /// `--airplay-helper-port 0` disables the fallback, which then has to stay disabled even for
+    /// the sender it would otherwise have handled.
+    #[cfg(feature = "airplay")]
+    #[tokio::test]
+    async fn no_helper_port_means_no_forwarding() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        assert_eq!(task.airplay_helper_port, None);
+
+        task.handle_airplay_event(AirplayEvent::SessionStarted {
+            connection: 1,
+            peer: "127.0.0.1".parse().expect("parses"),
+        })
+        .await;
+        task.handle_airplay_event(airplay_playing(1, true)).await;
+
+        assert!(
+            !task.forward_to_helper("pause").await,
+            "with no port configured there is nowhere to forward to"
         );
     }
 

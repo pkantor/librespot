@@ -47,6 +47,14 @@ use log::{info, warn};
 /// same way (`dacp_server.players_connection_thread_index`).
 #[derive(Debug, Clone)]
 pub enum AirplayEvent {
+    /// A sender opened an RTSP connection, carrying the one thing known about it from the very
+    /// first byte: its address.
+    ///
+    /// Deliberately separate from [`Self::DacpAvailable`], which says the same host is reachable
+    /// *for control* and only arrives after an mDNS resolve. Some senders — Apple Music on
+    /// Windows among them — send `DACP-ID`/`Active-Remote` but never resolve, so that event never
+    /// comes and their address would otherwise be unknown to a consumer.
+    SessionStarted { connection: u64, peer: IpAddr },
     /// `Active-Remote`/`DACP-ID` resolved to a reachable DACP endpoint — everything a caller
     /// needs to call [`dacp::send_command`](crate::dacp::send_command) itself.
     DacpAvailable {
