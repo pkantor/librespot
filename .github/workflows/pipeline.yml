@@ -34,6 +34,10 @@ jobs:
   quality:
     name: code quality
     runs-on: ubuntu-latest
+    # Well above a cold-cache run, but far below GitHub's 6-hour default. Without a bound, a
+    # hung step — `apt-get update` failing to reach archive.ubuntu.com is the one that actually
+    # happens — sits there for six hours instead of failing fast enough to just re-run.
+    timeout-minutes: 20
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -65,6 +69,7 @@ jobs:
   test:
     name: tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v5

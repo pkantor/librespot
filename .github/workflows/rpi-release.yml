@@ -33,6 +33,11 @@ jobs:
   build:
     name: build and publish aarch64 binary
     runs-on: ubuntu-latest
+    # Roomy enough for a cold cache, where the whole dependency tree is cross-compiled from
+    # scratch, but bounded: GitHub's default is 6 hours, and the step that hangs in practice is
+    # apt inside the cross container reaching archive.ubuntu.com. Failing at 45 minutes leaves a
+    # run that can simply be dispatched again.
+    timeout-minutes: 45
     permissions:
       contents: write # needed to create the release
 
