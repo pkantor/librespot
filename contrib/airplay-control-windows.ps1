@@ -39,7 +39,12 @@
     the Pi is what forwards. Loopback is always allowed; an empty list allows everyone.
 
 .PARAMETER AppPattern
-    Regex matching the SMTC session by SourceAppUserModelId. Empty means "whatever is playing".
+    Regex matching the SMTC session by SourceAppUserModelId, so commands reach the player that is
+    streaming and nothing else. When no session matches, no command is sent at all - anything else
+    would mean pausing whatever happens to be playing, a browser playing YouTube included.
+
+    Passing an empty string opts out of that protection and controls the system's current session,
+    whatever it is. Only sensible on a machine that plays nothing but this one app.
 
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -File .\airplay-control-windows.ps1
@@ -250,14 +255,29 @@ function Get-MusicSession {
         $manager = Await ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
         if ($null -eq $manager) { return $null }
 
-        if (-not [string]::IsNullOrWhiteSpace($AppPattern)) {
-            foreach ($session in $manager.GetSessions()) {
-                if ($session.SourceAppUserModelId -match $AppPattern) { return $session }
-            }
+        # An empty pattern is an explicit "control whatever is playing", and only then is the
+        # system's current session used.
+        if ([string]::IsNullOrWhiteSpace($AppPattern)) {
+            return $manager.GetCurrentSession()
         }
-        # No session matches the pattern, so fall back to whatever the system calls current. On a
-        # machine where only Apple Music plays, that is the same thing.
-        return $manager.GetCurrentSession()
+
+        $seen = @()
+        foreach ($session in $manager.GetSessions()) {
+            $id = $session.SourceAppUserModelId
+            $seen += $id
+            if ($id -match $AppPattern) { return $session }
+        }
+
+        # Nothing matched, and this deliberately does NOT fall back to the current session. That
+        # fallback used to be here and is exactly how a pause meant for Apple Music could stop a
+        # YouTube tab instead: on a machine where something else is playing, the current session
+        # is that something else. Doing nothing is the only safe answer, so say why and stop.
+        Write-Host (
+            "no session matching /$AppPattern/; refusing to control another app. Sessions: " +
+            $(if ($seen.Count) { $seen -join ', ' } else { '(none)' })
+        ) -ForegroundColor Yellow
+
+        return $null
     } catch {
         return $null
     }
