@@ -1563,8 +1563,23 @@ impl ApiServerTask {
             // Also the keepalive: renewing is subscribing again, which costs one small datagram
             // now that no response carries a picture.
             "subscribe" => {
-                self.renew_lease(peer);
+                let is_new = self.renew_lease(peer);
                 self.reply(&self.snapshot(), peer).await;
+
+                // A picture that arrived before this client did was announced to whoever was
+                // subscribed at the time, so without this a client joining mid-track has no reason
+                // to send `cover` and shows no artwork until the next track announces a new one.
+                // Only for a genuinely new subscription: a renewal arrives every lease period, and
+                // re-announcing there would have every client refetch the same cover forever.
+                if is_new {
+                    if let Some(cover) = &self.current_cover {
+                        let announcement = Event::CoverAvailable {
+                            mime: cover.mime,
+                            bytes: cover.bytes.len(),
+                        };
+                        self.reply(&announcement, peer).await;
+                    }
+                }
             }
             "unsubscribe" => {
                 if self.subscribers.remove(&peer).is_some() {
@@ -1576,14 +1591,21 @@ impl ApiServerTask {
     }
 
     /// Puts a client on the push list, or keeps it there for another lease.
-    fn renew_lease(&mut self, peer: SocketAddr) {
-        if self
+    ///
+    /// `true` when this was a new subscription rather than a renewal — the caller uses that to
+    /// tell a first-time subscriber about a cover that is already here, without repeating it on
+    /// every keepalive.
+    fn renew_lease(&mut self, peer: SocketAddr) -> bool {
+        let is_new = self
             .subscribers
             .insert(peer, Instant::now() + SUBSCRIPTION_LEASE)
-            .is_none()
-        {
+            .is_none();
+
+        if is_new {
             info!("{peer} subscribed to API events");
         }
+
+        is_new
     }
 
     fn snapshot(&self) -> Event<'_> {
@@ -2310,6 +2332,58 @@ mod tests {
         server.request("status").await;
         let snapshot = server.receive().await;
         assert!(snapshot["track"].get("cover_data").is_none());
+    }
+
+    /// A client that subscribes while something is already playing has to learn there is a picture
+    /// to ask for, the same as one that was there when it arrived.
+    #[tokio::test]
+    async fn a_late_subscriber_is_told_about_the_cover_already_playing() {
+        // The state a client walks in on: something is already playing and its picture is here.
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            task.current_cover = Some(Cover {
+                bytes: vec![0xab; 100],
+                mime: "image/jpeg",
+            });
+        })
+        .await;
+
+        server.request("subscribe").await;
+
+        let snapshot = server.receive().await;
+        assert_eq!(snapshot["event"], "snapshot");
+
+        // `cover_available` is broadcast when a picture *arrives*, so a client that subscribed
+        // afterwards never heard about this one and had no reason to send `cover` — it showed no
+        // artwork until the next track produced a fresh announcement.
+        let available = server.receive().await;
+        assert_eq!(available["event"], "cover_available");
+        assert_eq!(available["mime"], "image/jpeg");
+        assert_eq!(available["bytes"], 100);
+    }
+
+    /// Renewing a lease is `subscribe` again, every 10s in `api_test.py`. That must not re-announce
+    /// the same picture each time, or a subscriber refetches a cover it already has all day.
+    #[tokio::test]
+    async fn renewing_a_lease_does_not_re_announce_the_cover() {
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            task.current_cover = Some(Cover {
+                bytes: vec![0xab; 100],
+                mime: "image/jpeg",
+            });
+        })
+        .await;
+
+        server.request("subscribe").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
+        assert_eq!(server.receive().await["event"], "cover_available");
+
+        server.request("subscribe").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
+
+        assert!(
+            server.receives_nothing().await,
+            "a renewal announced the cover a second time"
+        );
     }
 
     /// The cover arrives in as many datagrams as it takes, each small enough to send anywhere,

@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `contrib/airplay-control-windows.ps1` is such a helper. Defaults to port 50506, `0` disables it.
 - [airplay] `AirplayEvent::SessionStarted`, carrying the address a sender connected from. Unlike
   `DacpAvailable` it needs no mDNS resolve, so it arrives for every sender. (breaking)
+
+### Fixed
+
+- [api] A client that subscribes while a track is already playing is now told about its cover.
+  `cover_available` was only broadcast at the moment a picture arrived, so a client joining
+  mid-track had no reason to send `cover` and showed no artwork until the next track. A renewal
+  does not re-announce it, so keepalives still cost one datagram.
 - [connect] Add method `add_to_queue` to `Spirc` to add tracks, episodes, albums and playlists to the queue
 - [playback] Add `SetQueue` player event, emitting when the queue changes (context loaded, track added to queue, or queue set via Spotify Connect). Gated behind `ConnectConfig::emit_set_queue_events`
 
