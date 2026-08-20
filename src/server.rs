@@ -42,7 +42,7 @@
 //! {"event":"playback_changed","is_playing":false,"position_ms":41200}
 //! {"event":"volume_changed","volume":32768}
 //! {"event":"cover_available","mime":"image/jpeg","bytes":184320}
-//! {"event":"cover_chunk","mime":"image/jpeg","index":0,"count":60,"data":"…"}
+//! {"event":"cover_chunk","mime":"image/jpeg","index":0,"count":60,"pending":false,"data":"…"}
 //! ```
 //!
 //! `position_ms` is always valid at the moment the datagram is sent, so a client extrapolates it
@@ -63,6 +63,18 @@
 //! them and to notice a lost one. A track with no cover is answered with a single `count: 0`,
 //! which is an answer rather than silence. Nothing is retransmitted: a client that misses a chunk
 //! asks again.
+//!
+//! `count: 0` alone would mean two different things, and a client would have no way to tell them
+//! apart. The picture is fetched from Spotify when the track changes, which takes a few hundred
+//! milliseconds, and a client watching `track_changed` asks inside that window — so "no cover"
+//! and "no cover *yet*" both had to come out as `count: 0`. Believing it means showing nothing
+//! for the whole track; disbelieving it means asking forever at tracks that genuinely have none.
+//!
+//! So the answer says which it is. `pending: true` means a fetch is still running and this track
+//! may well have a picture: wait for `cover_available` and ask again. `pending: false` with
+//! `count: 0` is final — this track has no cover, and there is nothing to wait for. Chunks
+//! carrying picture always report `pending: false`; the field only ever decides anything on the
+//! `count: 0` answer, but is on every chunk so the event has one shape.
 //!
 //! Because nothing is retransmitted, the size of a picture decides whether it arrives at all, and
 //! two things keep that in hand. The chunks go out in paced bursts ([`COVER_BURST_PAUSE`]) instead
@@ -146,10 +158,11 @@ const MAX_DATAGRAM_SIZE: usize = 1024;
 const COVER_CHUNK_BYTES: usize = ((MTU_UDP_PAYLOAD - COVER_CHUNK_ENVELOPE_BYTES) / 4) * 3;
 
 /// What [`Event::CoverChunk`]'s JSON costs around the base64 at its worst: the longest mime
-/// [`cover_mime`] reports, and four digits each of `index` and `count` (a cover of
-/// [`MAX_COVER_BYTES`] does not reach five). Only used to size [`COVER_CHUNK_BYTES`], and only
-/// right as long as the event's shape is — which is what `chunk_datagrams_fit_one_frame` checks.
-const COVER_CHUNK_ENVELOPE_BYTES: usize = 93;
+/// [`cover_mime`] reports, four digits each of `index` and `count` (a cover of
+/// [`MAX_COVER_BYTES`] does not reach five), and `"pending":false`, the longer of the two values
+/// that field takes. Only used to size [`COVER_CHUNK_BYTES`], and only right as long as the
+/// event's shape is — which is what `chunk_datagrams_fit_one_frame` checks.
+const COVER_CHUNK_ENVELOPE_BYTES: usize = 109;
 
 /// What a UDP payload has to stay inside to cross an Ethernet or Wi-Fi link as one packet: 1500
 /// bytes of MTU less 20 of IP header and 8 of UDP header. Past this the kernel splits the datagram
@@ -458,6 +471,7 @@ impl ApiServer {
                 playback: PlaybackState::default(),
                 covers: CoverCache::default(),
                 current_cover: None,
+                cover_pending: false,
                 cover_tx,
                 cover_rx,
                 #[cfg(feature = "airplay")]
@@ -555,12 +569,19 @@ enum Event<'a> {
         mime: &'static str,
         bytes: usize,
     },
-    /// One chunk of an answer to `cover`, `index` of `count`. `count: 0` means there is no cover
-    /// for the current track.
+    /// One chunk of an answer to `cover`, `index` of `count`.
+    ///
+    /// `count: 0` means there is no picture to send, and `pending` says why: `true` while the
+    /// cover for the current track is still being fetched — ask again once `cover_available`
+    /// arrives — and `false` when this track simply has no cover, which is final. Without it a
+    /// client cannot tell "none" from "not yet", and the two need opposite responses.
+    ///
+    /// Chunks that carry picture always report `pending: false`: the answer is right here.
     CoverChunk {
         mime: &'a str,
         index: usize,
         count: usize,
+        pending: bool,
         data: String,
     },
 }
@@ -924,6 +945,13 @@ struct ApiServerTask {
     /// The cover of whatever is playing, once there is one. Never part of a track event or any
     /// other response — a client asks for it with `cover` and gets it in chunks.
     current_cover: Option<Cover>,
+    /// Whether a fetch (or an off-loop shrink) for the current track's cover is still running.
+    ///
+    /// Reported as `pending` on the `count: 0` answer, which is the whole reason it is tracked:
+    /// it is what lets a client tell "this track has no cover" from "the picture isn't here
+    /// yet". Set for exactly as long as something is on its way — every path that ends a wait
+    /// clears it, so a client is never told to keep waiting for something that isn't coming.
+    cover_pending: bool,
     cover_tx: mpsc::UnboundedSender<CoverFetched>,
     cover_rx: mpsc::UnboundedReceiver<CoverFetched>,
     /// `None` until `set_airplay_events` hands one over (or forever, if AirPlay isn't running at
@@ -1151,6 +1179,8 @@ impl ApiServerTask {
     async fn clear_now_playing(&mut self) {
         self.current_track = TrackResponse::default();
         self.current_cover = None;
+        // nothing is playing, so nothing is on its way either
+        self.cover_pending = false;
         self.announce_track().await;
         self.update_playback(Some(false), 0).await;
     }
@@ -1382,8 +1412,14 @@ impl ApiServerTask {
     /// The track event does **not** wait for it: covers travel only in answer to a `cover`
     /// request now, so there is nothing to hold the announcement for. A client learns the picture
     /// arrived from [`Event::CoverAvailable`] and asks for it when it wants it.
+    ///
+    /// Every exit sets `cover_pending`, and only the spawning one sets it true: a cover served
+    /// from the cache, a track with no artwork and a missing session are all cases where nothing
+    /// further is coming, and a client asking now deserves a final answer rather than being told
+    /// to wait for a fetch that will never report back.
     fn load_cover(&mut self, url: Option<String>) {
         self.current_cover = None;
+        self.cover_pending = false;
 
         let Some(url) = url else {
             return;
@@ -1397,11 +1433,19 @@ impl ApiServerTask {
             debug!("no session to fetch the cover with yet");
             return;
         };
+
+        self.cover_pending = true;
         tokio::spawn(fetch_cover(session, url, self.cover_tx.clone()));
     }
 
     /// Takes a fetched cover and tells subscribers it is there to be asked for.
+    ///
+    /// Reports back on every outcome, failure and timeout included, which is what makes this the
+    /// one place `cover_pending` has to be cleared: past here nothing is on its way any more, and
+    /// a `count: 0` answer stops meaning "wait".
     async fn handle_cover(&mut self, fetched: CoverFetched) {
+        self.cover_pending = false;
+
         // worth keeping even if a newer track overtook this fetch: whatever overtook it was most
         // likely a skip, and a skip back wants this picture again
         let Some(cover) = fetched.cover else {
@@ -1430,6 +1474,11 @@ impl ApiServerTask {
 
         let cover_tx = self.cover_tx.clone();
 
+        // a shrink is the same kind of wait as a fetch: the picture is not here yet, but it is
+        // coming, and a client asking meanwhile should be told to wait rather than that there is
+        // nothing — it reports back through the same channel, so `handle_cover` clears this
+        self.cover_pending = true;
+
         tokio::spawn(async move {
             let cover = shrink_cover_off_thread(cover).await;
 
@@ -1445,14 +1494,18 @@ impl ApiServerTask {
             bytes: cover.bytes.len(),
         });
         self.current_cover = Some(cover);
+        self.cover_pending = false;
         self.broadcast(payload).await;
     }
 
     /// Answers `cover` with the current picture, split across as many datagrams as it takes.
     ///
     /// One response per chunk, in order, each carrying its index and the total — so a client can
-    /// reassemble them and tell a lost one from the end of the picture. A track with no cover
-    /// (yet) is answered with a single `count: 0`, which is a real answer rather than silence.
+    /// reassemble them and tell a lost one from the end of the picture.
+    ///
+    /// With no picture to send the answer is a single `count: 0`, which is a real answer rather
+    /// than silence — and it carries `pending`, so the client knows whether that is final or
+    /// whether the fetch simply hasn't landed yet. See [`Event::CoverChunk`].
     ///
     /// Sent in bursts of [`COVER_CHUNK_BURST`] with a [`COVER_BURST_PAUSE`] between them, so the
     /// client's receive buffer is never the reason a chunk goes missing.
@@ -1463,6 +1516,7 @@ impl ApiServerTask {
                     mime: "",
                     index: 0,
                     count: 0,
+                    pending: self.cover_pending,
                     data: String::new(),
                 },
                 peer,
@@ -1487,6 +1541,8 @@ impl ApiServerTask {
                     mime: cover.mime,
                     index,
                     count: chunks.len(),
+                    // the picture is right here, so there is nothing left to wait for
+                    pending: false,
                     data: BASE64.encode(chunk),
                 },
                 peer,
@@ -1945,6 +2001,8 @@ mod tests {
             mime: "application/octet-stream",
             index: last,
             count: last,
+            // the longer of the two, so the envelope is measured at its worst
+            pending: false,
             data: BASE64.encode(&vec![0xab; COVER_CHUNK_BYTES]),
         })
         .expect("encodes");
@@ -2219,6 +2277,7 @@ mod tests {
             playback: PlaybackState::default(),
             covers: CoverCache::default(),
             current_cover: None,
+            cover_pending: false,
             cover_tx,
             cover_rx,
             #[cfg(feature = "airplay")]
@@ -2332,6 +2391,90 @@ mod tests {
         server.request("status").await;
         let snapshot = server.receive().await;
         assert!(snapshot["track"].get("cover_data").is_none());
+    }
+
+    /// The window that made `count: 0` mean two things: the fetch from Spotify starts when the
+    /// track changes, and a client watching `track_changed` asks inside it. The answer has to say
+    /// so, or the client either shows nothing all track or never believes a `count: 0` at all.
+    #[tokio::test]
+    async fn a_cover_still_being_fetched_is_answered_as_pending() {
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            // what the state looks like between `track_changed` and the cover landing
+            task.cover_pending = true;
+        })
+        .await;
+
+        server.request("cover").await;
+
+        let chunk = server.receive().await;
+        assert_eq!(chunk["event"], "cover_chunk");
+        assert_eq!(chunk["count"], 0);
+        // told `count: 0` here, a client shows no artwork for the whole track
+        assert_eq!(chunk["pending"], true);
+    }
+
+    /// The other half of the same guarantee: with nothing being fetched, `count: 0` is final and
+    /// a client can act on it. A client that keeps asking at every track without artwork is no
+    /// better off than one that was told to give up too early.
+    #[tokio::test]
+    async fn a_track_with_no_cover_is_answered_as_final() {
+        let server = TestServer::start(AllowList::default()).await;
+
+        server.request("cover").await;
+
+        let chunk = server.receive().await;
+        assert_eq!(chunk["event"], "cover_chunk");
+        assert_eq!(chunk["count"], 0);
+        assert_eq!(chunk["pending"], false);
+    }
+
+    /// Whatever the fetch reports — a picture, a failure, a timeout — it comes back through one
+    /// channel, and past it nothing is on its way. `pending` has to stop saying otherwise, or a
+    /// client waits out a cover that is never coming.
+    #[tokio::test]
+    async fn a_cover_fetch_that_fails_stops_being_pending() {
+        let mut cover_tx = None;
+
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            task.cover_pending = true;
+            cover_tx = Some(task.cover_tx.clone());
+        })
+        .await;
+
+        let cover_tx = cover_tx.expect("the task handed one over");
+        let fetched = CoverFetched {
+            url: None,
+            cover: None,
+        };
+
+        cover_tx.send(fetched).expect("the task is still running");
+
+        // the send above only queues it; asking gives the loop a turn to take it first
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.request("cover").await;
+
+        let chunk = server.receive().await;
+        assert_eq!(chunk["count"], 0);
+        assert_eq!(chunk["pending"], false);
+    }
+
+    /// A chunk carrying picture is its own answer, so it never asks anyone to wait.
+    #[tokio::test]
+    async fn a_chunk_carrying_picture_is_never_pending() {
+        let server = TestServer::start_with(AllowList::default(), |task| {
+            task.current_cover = Some(Cover {
+                bytes: vec![0xcd; 100],
+                mime: "image/jpeg",
+            });
+        })
+        .await;
+
+        server.request("cover").await;
+
+        let chunk = server.receive().await;
+        assert_eq!(chunk["event"], "cover_chunk");
+        assert_eq!(chunk["count"], 1);
+        assert_eq!(chunk["pending"], false);
     }
 
     /// A client that subscribes while something is already playing has to learn there is a picture

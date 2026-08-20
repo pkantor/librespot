@@ -24,7 +24,12 @@ What a client has to get right, all of which this script demonstrates:
     which re-syncs the client after a dropped event.
   * no response carries the cover. A track event is small; the picture is asked for with
     `cover` and arrives as a series of `cover_chunk` datagrams to reassemble in `index`
-    order. `count` says how many to expect, and `count: 0` means this track has none.
+    order. `count` says how many to expect, and `count: 0` means there is none to send.
+  * `pending` says whether a `count: 0` is final. The picture is fetched when the track
+    changes and takes a moment, and a client watching `track_changed` asks inside that
+    window, so the two cases have to be told apart. `pending: true` means not yet: wait
+    for `cover_available` and ask again. `pending: false` means this track has no cover
+    at all and there is nothing to wait for. Chunks carrying picture are never pending.
   * `cover_available` says a picture is ready to be asked for — the moment to send `cover`
     if you want one. It is pushed to subscribers only.
   * nothing is retransmitted. If a chunk goes missing (the count doesn't add up, or a
@@ -130,6 +135,8 @@ def format_event(payload):
     if event == "cover_chunk":
         count = payload.get("count", 0)
         if count == 0:
+            if payload.get("pending"):
+                return "cover_chunk: the cover is still being fetched, ask again"
             return "cover_chunk: this track has no cover"
         return f"cover_chunk: {payload.get('index', 0) + 1} of {count}"
 
@@ -183,6 +190,8 @@ class CoverAssembly:
     def add(self, payload):
         count = payload.get("count", 0)
 
+        # A `count: 0` never reaches here: it carries no chunk, and with `pending` it is not
+        # even a statement about the picture. The caller sorts that out.
         if count != self.count:
             # a new cover: forget a half-received one rather than mixing two pictures
             self.chunks = {}
@@ -229,7 +238,11 @@ class Client:
         self.asked_for = None
 
     def on_cover_available(self):
-        """The server has a picture for what is playing; ask for it if we want one."""
+        """The server has a picture for what is playing; ask for it if we want one.
+
+        Also how a `pending` answer gets retried: `on_cover_chunk` forgets having asked, and
+        the fetch that was still running is what pushes this once it lands.
+        """
         if not self.covers_dir:
             return
 
@@ -241,6 +254,16 @@ class Client:
         self.send("cover")
 
     def on_cover_chunk(self, payload):
+        if payload.get("count", 0) == 0:
+            if payload.get("pending"):
+                # asked while the fetch was still running, so this says nothing about the
+                # track: forget having asked and let `cover_available` ask again
+                self.asked_for = None
+            # `pending: false` is final — this track has no cover, and asking again at the
+            # same one would only ever get the same answer
+            self.assembly = CoverAssembly()
+            return
+
         cover = self.assembly.add(payload)
 
         if cover is not None:
