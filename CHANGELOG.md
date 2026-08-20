@@ -15,12 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata pushes.
 - [airplay] Remote control of the sender over DACP: `pause`, `resume` and `next` reach the phone
   that is streaming, alongside volume in both directions.
-- [api] AirPlay is reported through the same UDP API as Spotify Connect, in the same shape: a
+- [api] AirPlay is reported through the same control API as Spotify Connect, in the same shape: a
   `source` field (`"spotify"` or `"airplay"`) says which is playing, and `pause`/`resume`/`next`
   are routed to whichever source last played — including after it stopped, so `resume` reaches
   the phone that was streaming rather than an idle Spotify session.
-- [api] `cover` command, answering with the current cover art split across as many `cover_chunk`
-  datagrams as it takes, and a `cover_available` event announcing that there is one to ask for.
+- [api] `cover` event, carrying the current cover art whole, base64. Pushed to subscribers when a
+  picture arrives and to a client that subscribes while something is already playing, so a
+  subscriber never asks for artwork — `subscribe` and `unsubscribe` are the whole client side of
+  the API. It only ever carries a picture: a track with no cover, one whose fetch failed and one
+  still being fetched are all simply quiet, and a client that draws nothing from `track_changed`
+  until a `cover` arrives is right in all three.
 - [api] `--airplay-helper-port`: `next`/`pause`/`resume` for an AirPlay sender that offers no DACP
   endpoint are forwarded to a helper on that sender's own machine, at the address its RTSP
   connection came from. Apple Music on Windows sends `DACP-ID`/`Active-Remote` but never resolves
@@ -32,10 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- [api] A client that subscribes while a track is already playing is now told about its cover.
-  `cover_available` was only broadcast at the moment a picture arrived, so a client joining
-  mid-track had no reason to send `cover` and showed no artwork until the next track. A renewal
-  does not re-announce it, so keepalives still cost one datagram.
+- [api] A client that subscribes while a track is already playing is now sent its cover. The push
+  happens when a picture arrives, which for such a client was before it connected, so it showed no
+  artwork until the next track.
+- [api] A cover served from the cache is pushed like any other. Skipping back to a track whose
+  picture was still held set it without telling anyone, so subscribers showed no artwork for it.
 - [connect] Add method `add_to_queue` to `Spirc` to add tracks, episodes, albums and playlists to the queue
 - [playback] Add `SetQueue` player event, emitting when the queue changes (context loaded, track added to queue, or queue set via Spotify Connect). Gated behind `ConnectConfig::emit_set_queue_events`
 
@@ -54,31 +59,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the receiver's identity is now derived from its name, so it is stable across restarts with
   nothing stored. (breaking)
 - [main] `airplay-remote-control` is a default feature.
-- [api] Removed `subscribe_refresh`. It existed only to renew a lease without dragging the cover
-  along; with covers out of every response there is nothing cheaper to send, so renewing is
-  `subscribe` again — which registers a client that isn't subscribed just as it always did.
+- [api] The control API speaks TCP instead of UDP. A client opens one connection and reads
+  newline-delimited JSON off it; `--api-bind` is unchanged, and so are the command names and the
+  shape of every response. What goes away is everything the datagrams needed: subscriptions no
+  longer expire, so there is no 30-second lease and no keepalive — the connection *is* the
+  subscription, and a client that goes away is noticed by the socket closing. Nothing is lost or
+  reordered either, so the `snapshot` answering `subscribe` plus the events after it is the whole
+  state, with nothing to re-sync against. A client that stops reading has its connection closed
+  once its queue fills, since on a stream there is no way to skip an event and leave it
+  consistent; reconnecting is the answer, and the fresh snapshot is the re-sync. (breaking)
+- [api] Removed `subscribe_refresh`. It existed only to renew a lease, and there are no leases.
   (breaking)
-- [api] Cover art no longer travels in `current_track`, `status` or any event: the `cover_data`,
-  `cover_mime`, `cover_width` and `cover_height` fields are gone, and a client asks for the
-  picture with `cover` instead. Carrying one made those responses larger than a datagram can be
-  sent as (`Message too long`), which lost the whole response rather than just the picture.
-  Freed of that limit, the cover fetched from Spotify is now the largest on offer rather than the
-  smallest one big enough to display, and a sender's own artwork is kept as it arrived unless it
-  is large enough to need shrinking. (breaking)
+- [api] Removed the `cover` command and the `pending` field. Both existed so a client could ask
+  for a picture and be told why an empty answer was empty; a client is sent the picture now, so
+  neither has anything left to do. (breaking)
+- [api] Cover art no longer travels in `current_track` or `status`: the `cover_data`,
+  `cover_mime`, `cover_width` and `cover_height` fields are gone, and the picture arrives as its
+  own `cover` event instead. It is separate from `track_changed` because it is fetched and so is
+  not there yet when the track changes — carrying it along meant holding the track event back for
+  it. The cover fetched from Spotify is the largest on offer rather than the smallest one big
+  enough to display. (breaking)
+- [api] Cover art is never re-encoded. Every picture is held and sent exactly as the source
+  published it, up to the 2 MB a cover may be at all — so a `cover` event can be a line of some
+  2.7 MB of base64, which a client's line reader has to be sized for. The re-encode this replaces
+  (anything over 256 kB down to 640 px of JPEG) existed only because UDP could not deliver a
+  1.4 MB artwork, and it cost the one thing a client actually sees. The `image` dependency is gone
+  with it. (breaking)
 - [core] Made `SpotifyId::to_base62`, `SpotifyId::to_base16`, `FileId::to_base16`, `SpotifyUri::to_id`, `SpotifyUri::to_uri` infallible (breaking)
 
 ### Fixed
 
 - [api] Cover art from an AirPlay sender that pushes it at full size now arrives. iTunes on
-  Windows sends a 1.4 MB PNG, which `cover` split into ~460 datagrams fired back to back —
-  far more than a client's receive buffer holds, and since nothing is retransmitted, asking
-  again only lost the same race. Chunks now go out in paced bursts, and a picture over 256 kB
-  is re-encoded to at most 640 px of JPEG before it is held.
-- [api] `cover_chunk` datagrams are no longer IP-fragmented. A chunk was 3 kB of picture, which
-  with base64 and the JSON envelope made a ~4.2 kB datagram — nearly three times the 1472 bytes
-  an Ethernet or Wi-Fi MTU leaves for a UDP payload, so the kernel split every one of them into
-  three fragments and any fragment lost took the whole chunk with it. A chunk is now sized from
-  that budget instead — 1032 bytes — so the datagram crosses a link in one piece.
+  Windows sends a 1.4 MB PNG, which the UDP API split into ~460 datagrams fired back to back —
+  far more than a client's receive buffer holds, and since nothing was retransmitted, asking
+  again only lost the same race. It is one write now.
 - [airplay] The mDNS advertisement is registered with the standard 75-minute TTL real receivers
   use, rather than libmdns's one-minute default. libmdns announces only once, so the receiver's
   visibility depended on every refresh answer inside each minute arriving. This did **not** on

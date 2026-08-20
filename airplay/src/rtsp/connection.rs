@@ -65,7 +65,7 @@ pub(crate) struct ConnectionContext {
     /// The list `--airplay-bind-ip` restricts this crate's mDNS advertising to, reused to
     /// restrict the DACP resolver's interfaces — see `dacp::resolve_port`.
     pub(crate) bind_ip: Arc<Vec<std::net::IpAddr>>,
-    /// The receiver's own output gain, shared by every connection and by the UDP API — see
+    /// The receiver's own output gain, shared by every connection and by the control API — see
     /// `AirplayControl`. A `Sender` rather than a `Receiver` because a sender's own
     /// `SET_PARAMETER volume:` sets it too.
     pub(crate) volume: Arc<tokio::sync::watch::Sender<f64>>,
@@ -96,7 +96,7 @@ pub(crate) async fn serve_connection(
     // back (`dacp::DacpTarget::scope_id`).
     let peer_addr = stream.peer_addr().ok();
     // Announced before anything is parsed: this is the only address a sender that never resolves
-    // a DACP port ever offers, and the fork's UDP API routes on it (`AirplayEvent::SessionStarted`).
+    // a DACP port ever offers, and the fork's control API routes on it (`AirplayEvent::SessionStarted`).
     if let Some(peer) = peer_addr {
         let _ = airplay_events.send(AirplayEvent::SessionStarted {
             connection,
@@ -206,7 +206,7 @@ pub(crate) async fn serve_connection(
             Some(RtspAction::SetVolume { gain, percent }) => {
                 // The sender's own slider. Applied to this receiver's output — an AirPlay sender
                 // expects the receiver to attenuate, it does not send pre-scaled audio — and
-                // reported onward so a client of the UDP API sees the same number the phone
+                // reported onward so a client of the control API sees the same number the phone
                 // shows.
                 let _ = volume.send(gain);
                 let _ = airplay_events.send(AirplayEvent::VolumeChanged {

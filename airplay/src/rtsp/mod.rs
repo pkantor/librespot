@@ -104,7 +104,7 @@ pub(crate) enum RtspAction {
     SetVolume {
         /// Linear amplitude multiplier for the decoded samples.
         gain: f64,
-        /// The same value as a percentage, for reporting onward — a client of the fork's UDP API
+        /// The same value as a percentage, for reporting onward — a client of the fork's control API
         /// publishes percentages, not decibels.
         percent: u8,
     },

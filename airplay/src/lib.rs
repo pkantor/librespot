@@ -15,7 +15,7 @@
 //! `dmap` reads the metadata, cover art and position a sender pushes.
 //!
 //! Everything it plays and everything a client can do to it is reported through
-//! [`AirplayEvent`], which the fork's `ApiServer` (`src/server.rs`) turns into the same UDP API
+//! [`AirplayEvent`], which the fork's `ApiServer` (`src/server.rs`) turns into the same control API
 //! Spotify Connect already uses there.
 //!
 //! Audio only. No mirroring or video stream type is or will be handled.
@@ -160,7 +160,7 @@ enum AirplayServerCommand {
 }
 
 /// A cheap, clonable handle for controlling a running [`AirplayServer`] from outside — currently
-/// the fork's `ApiServer` (`src/server.rs`), so a client on the UDP API can set the volume.
+/// the fork's `ApiServer` (`src/server.rs`), so a client on the control API can set the volume.
 ///
 /// Volume is the receiver's own output gain rather than anything sent back to the sender: an
 /// AirPlay 2 sender exposes no way to be told to change its volume that this crate can reach (its
@@ -183,7 +183,7 @@ impl AirplayControl {
 }
 
 /// The inverse of [`db_from_percent`], for reporting a sender's own volume change onward as the
-/// percentage the fork's UDP API publishes.
+/// percentage the fork's control API publishes.
 pub(crate) fn percent_from_db(db: f64) -> u8 {
     if db <= -144.0 {
         return 0;
@@ -236,7 +236,7 @@ impl AirplayServer {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         // One gain for the whole receiver rather than one per connection: there is a single audio
         // output, and both ways of changing the volume — the sender's `SET_PARAMETER volume:` and
-        // a client on the UDP API — mean the same thing by it.
+        // a client on the control API — mean the same thing by it.
         let (volume_tx, _) = tokio::sync::watch::channel(1.0);
         let volume = Arc::new(volume_tx);
         let connection_volume = volume.clone();
@@ -318,7 +318,7 @@ mod tests {
     use super::*;
 
     /// Both ways of changing the volume — a sender's own `SET_PARAMETER volume:` and a client on
-    /// the UDP API — have to land on one scale, so the two conversions must be inverses.
+    /// the control API — have to land on one scale, so the two conversions must be inverses.
     #[test]
     fn the_volume_conversions_are_inverses() {
         for percent in [1u8, 25, 50, 99, 100] {

@@ -1,2 +1,21 @@
+# Pinned on purpose, and fork-local: upstream ships this file with no `channel`.
+#
+# Without it the compiler floats. CI installs `dtolnay/rust-toolchain@stable`, contributors have
+# whatever they have, and a new stable release can turn a green branch red with no commit in
+# between — which is exactly what happened when 1.98.0 landed on 2026-08-18 and its wider
+# `clippy::needless_late_init` fired on upstream code in `src/main.rs` untouched since 2025-08-13.
+# CI runs with `-D warnings`, so that failed `quality`, and `rpi-release` is gated on it: a lint
+# added upstream of this repo entirely was enough to block deploying to the Pi.
+#
+# The action only calls `rustup default`, never `rustup override set` and never sets
+# `RUSTUP_TOOLCHAIN`, so this file wins in CI as well as locally — no workflow change needed.
+#
+# **Remove the `channel` line, or bump it, when the merge from upstream brings their fix for that
+# lint.** It is not here to avoid new compilers forever; it is here so that moving to one is a
+# deliberate act, where the new lints get fixed once, on purpose, instead of being discovered in
+# the middle of a deploy. Bumping means: change the version, run
+# `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` (rustfmt
+# reformats between versions too), and fix what falls out.
 [toolchain]
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]

@@ -1,10 +1,15 @@
-//! A small UDP control API for the librespot binary.
+//! A small TCP control API for the librespot binary.
 //!
-//! # Requests
+//! # The connection
 //!
-//! The server accepts plain text datagrams, one command per datagram, in the form
-//! `<command>[ <json payload>]`. Commands that query state answer with a JSON datagram sent back
-//! to the requesting socket:
+//! A client opens a TCP connection and keeps it open for as long as it wants to be talked to.
+//! Everything travels over it as newline-delimited text: one message per line, in both
+//! directions. `serde_json` never writes a raw newline inside a value, so `\n` is a frame
+//! boundary and nothing has to be escaped or counted; a trailing `\r` on a request is stripped,
+//! so a client that sends CRLF works too.
+//!
+//! Requests are plain text, `<command>[ <json payload>]`, one per line. Commands that query state
+//! answer on the same connection:
 //!
 //! | command             | payload             | response                        |
 //! |---------------------|---------------------|---------------------------------|
@@ -18,90 +23,105 @@
 //! | `current_track`     | -                   | [`TrackResponse`] as JSON       |
 //! | `status`            | -                   | `snapshot` event as JSON        |
 //! | `subscribe`         | -                   | `snapshot` event as JSON        |
-//! | `cover`             | -                   | `cover_chunk` events as JSON    |
 //! | `unsubscribe`       | -                   | -                               |
 //!
 //! # Push events
 //!
-//! `subscribe` registers the sender for push events for [`SUBSCRIPTION_LEASE`] and answers with a
-//! `snapshot` of the full state. Clients are expected to renew well within the lease as a
-//! keepalive; that also re-syncs them, so a dropped datagram leaves a client stale for at most one
-//! keepalive interval instead of indefinitely. A client that goes away silently is dropped when
-//! its lease runs out; `unsubscribe` deregisters it right away.
+//! `subscribe` puts the connection on the push list and answers with a `snapshot` of the full
+//! state; `unsubscribe` takes it off again without closing anything. There is no lease and no
+//! keepalive: the connection *is* the subscription, and it ends when the socket does. A client
+//! that goes away — cleanly, by crashing, or by losing the network — is noticed by TCP itself.
 //!
-//! Renewing is just `subscribe` again: it registers a sender that isn't subscribed yet and
-//! refreshes one that is, so a client that lost its lease keeps going without noticing, and every
-//! keepalive doubles as a re-sync. There is nothing cheaper to send instead, since no response
-//! carries a picture any more.
+//! **`subscribe` and `unsubscribe` are the whole client side of this.** Everything a subscriber
+//! needs is pushed, artwork included; nothing has to be asked for, polled, retried or correlated
+//! with a request. Nothing is lost, duplicated or reordered on a stream either, so the `snapshot`
+//! plus every event since it *is* the state, by construction.
 //!
-//! Events are JSON datagrams discriminated by their `event` field:
+//! Events are JSON lines discriminated by their `event` field:
 //!
 //! ```json
 //! {"event":"snapshot","is_playing":true,"position_ms":41200,"volume":32768,"track":{…}}
 //! {"event":"track_changed","track":{…}}
 //! {"event":"playback_changed","is_playing":false,"position_ms":41200}
 //! {"event":"volume_changed","volume":32768}
-//! {"event":"cover_available","mime":"image/jpeg","bytes":184320}
-//! {"event":"cover_chunk","mime":"image/jpeg","index":0,"count":60,"pending":false,"data":"…"}
+//! {"event":"cover","mime":"image/jpeg","bytes":184320,"data":"…"}
 //! ```
 //!
-//! `position_ms` is always valid at the moment the datagram is sent, so a client extrapolates it
-//! against its own clock (`position_ms` plus the time since the datagram arrived, while
-//! `is_playing`) and never has to agree with this machine on what time it is.
+//! A whole client is therefore: connect, send `subscribe`, read lines, switch on `event`. The
+//! query commands exist for a different audience — something that connects, asks one question and
+//! leaves — and a subscriber has no reason to send any of them.
+//!
+//! `position_ms` is always valid at the moment the line is written, so a client extrapolates it
+//! against its own clock (`position_ms` plus the time since it arrived, while `is_playing`) and
+//! never has to agree with this machine on what time it is.
+//!
+//! # Keeping up
+//!
+//! What a stream gives in reliability it takes back in coupling: a client that stops reading
+//! stops the writer, and the one thing that must never happen here is a stalled PC in another
+//! room holding up the task that also handles player events. So a connection never blocks the
+//! loop. Each one gets its own writer task fed by a bounded queue ([`CONNECTION_QUEUE`]), the
+//! loop only ever tries to enqueue, and a queue that is full means the client is not draining its
+//! socket — at which point the connection is dropped rather than waited on.
+//!
+//! Dropping it is the honest answer: on a stream there is no such thing as skipping one event and
+//! carrying on, since the client would silently hold a state that never becomes right again.
+//! Closing the socket tells it so, and a client that reconnects and subscribes gets a fresh
+//! snapshot.
+//!
+//! # What a client has to size for
+//!
+//! A line has no length field, so a client reads until `\n` — which needs a bound, or a peer
+//! decides how much it buffers. That bound is published rather than left to guess: the longest
+//! line this server can produce is a `cover` answer at [`MAX_COVER_BYTES`], which base64 grows by
+//! a third before the JSON envelope goes round it, so **2.8 MB is enough for any line** and
+//! `the_longest_line_is_bounded` fails if that stops being true. Every other line is a few hundred
+//! bytes.
+//!
+//! That is the second job [`MAX_COVER_BYTES`] does, and the reason it still exists now that no
+//! datagram has to hold a picture: without a cap on what is accepted there is no figure to hand a
+//! client, and "read until newline" has no safe implementation.
+//!
+//! The other half is a read timeout, and what it may mean. This server sends nothing at all while
+//! nothing happens, so silence on an idle connection is normal and must not be mistaken for a
+//! stall — a timeout is only evidence of trouble *part-way through a line*, where the rest was
+//! promised and never came. A client that also wants to notice a peer that vanished without
+//! closing the socket (a Pi losing power, Wi-Fi dropping) sends something itself now and then and
+//! expects the answer; `status` is there for exactly that and costs the server no state.
+//! `contrib/api_test.py` implements all of this the long way round, to be read as the spec.
 //!
 //! # Cover art
 //!
-//! Covers travel **only** in answer to the `cover` command, never in a track event or any other
-//! response. A picture is a hundred times the size of everything else here — a real AirPlay
-//! sender pushes ~180 kB, which base64 turns into 240 kB — and carrying one in a track event
-//! meant the event exceeded what a datagram can hold: the send fails outright (`Message too
-//! long`) and the client sees nothing at all. So every response is small now, and a client that
-//! wants a picture asks for one.
+//! A cover is **pushed** to subscribers, as its own `cover` event carrying the whole picture, the
+//! moment there is one — and again to a client that subscribes while something is already
+//! playing. A subscriber never asks for artwork.
 //!
-//! `cover` answers with as many `cover_chunk` datagrams as it takes, each carrying
-//! [`COVER_CHUNK_BYTES`] of the picture, its own `index` and the `count` — enough to reassemble
-//! them and to notice a lost one. A track with no cover is answered with a single `count: 0`,
-//! which is an answer rather than silence. Nothing is retransmitted: a client that misses a chunk
-//! asks again.
+//! It is a separate event rather than a field on `track_changed` because the picture is not there
+//! yet when the track changes: it is fetched from Spotify, which takes a few hundred
+//! milliseconds. Folding it in would mean holding the track event back for it, which is what an
+//! earlier design did and is worth not repeating — what is playing should be reported the instant
+//! it is known. So `track_changed` arrives first and means "forget the old artwork", and the
+//! `cover` event follows if there is any. A track with no cover simply never produces one.
 //!
-//! `count: 0` alone would mean two different things, and a client would have no way to tell them
-//! apart. The picture is fetched from Spotify when the track changes, which takes a few hundred
-//! milliseconds, and a client watching `track_changed` asks inside that window — so "no cover"
-//! and "no cover *yet*" both had to come out as `count: 0`. Believing it means showing nothing
-//! for the whole track; disbelieving it means asking forever at tracks that genuinely have none.
+//! There is no way to *ask* for a cover, and no event saying a track hasn't got one. Both existed
+//! and both are gone, because a push makes them unnecessary and neither survived the question of
+//! what a client would do with them. Asking meant a client had to hold request state and tell an
+//! answer from an event; a negative answer meant distinguishing "no cover" from "not yet", which
+//! needed a `pending` flag to be correct at all. Under a push, `track_changed` clears the artwork
+//! and a `cover` either follows or doesn't — a track with no picture, one whose fetch failed, and
+//! one still fetching are all simply quiet, and a client that draws nothing until a `cover`
+//! arrives is right in every one of those cases without being told which it is.
 //!
-//! So the answer says which it is. `pending: true` means a fetch is still running and this track
-//! may well have a picture: wait for `cover_available` and ask again. `pending: false` with
-//! `count: 0` is final — this track has no cover, and there is nothing to wait for. Chunks
-//! carrying picture always report `pending: false`; the field only ever decides anything on the
-//! `count: 0` answer, but is on every chunk so the event has one shape.
+//! **Nothing re-encodes a picture.** Every cover is held and sent exactly as it arrived, up to
+//! [`MAX_COVER_BYTES`], and Spotify's *largest* cover is the one fetched. There used to be a
+//! shrink above 256 kB, down to 640 px of JPEG; it existed because UDP could not deliver iTunes
+//! on Windows pushing 1.4 MB of PNG, and on a stream that is simply a file transfer. What it cost
+//! was the one thing a client actually notices — the picture — so it went, and the `image`
+//! dependency with it.
 //!
-//! Because nothing is retransmitted, the size of a picture decides whether it arrives at all, and
-//! two things keep that in hand. The chunks go out in paced bursts ([`COVER_BURST_PAUSE`]) instead
-//! of one tight loop, which is what a client's receive buffer — tens of datagrams, not hundreds —
-//! can actually take in; and a picture over [`COVER_SHRINK_ABOVE_BYTES`] is re-encoded smaller
-//! ([`shrink_cover`]) before it is ever held. Both were learned from iTunes on Windows, which
-//! pushes its artwork at full size: 1.4 MB of PNG became ~460 datagrams fired back to back, the
-//! client's buffer overran every time, and the cover never appeared no matter how often it asked.
-//!
-//! A chunk is also sized so the datagram carrying it crosses a link in one packet
-//! ([`MTU_UDP_PAYLOAD`]) rather than as IP fragments. That is not what decides whether a picture
-//! arrives — the packet count is much the same either way — but fragments bring failure modes of
-//! their own, and none of them are worth carrying. See [`COVER_CHUNK_BYTES`].
-//!
-//! Within that, size is not otherwise a design constraint. Spotify's *largest* cover is fetched
-//! rather than the smallest one big enough to display, and anything already small enough is kept
-//! byte for byte as it arrived. `cover_available` tells subscribers a picture can be asked for, so
-//! nobody has to poll.
-//!
-//! Urls are still not reported at all: the clients here cannot reach the internet, only the Pi
-//! can. A cover is fetched once per track no matter how many clients are listening, and the last
-//! few are cached, so skipping back and forth doesn't refetch.
-//!
-//! No datagram this server sends exceeds one MTU, so nothing here depends on IP fragmentation and
-//! a modest receive buffer is enough — 64 kB per read is plenty. The platform difference that used
-//! to matter (macOS caps outgoing datagrams at `net.inet.udp.maxdgram`, 9216 by default, while
-//! Linux allows 65507) is far above anything sent now and no longer affects this server.
+//! Urls are not reported at all: the clients here cannot reach the internet, only the Pi can. A
+//! cover is fetched once per track no matter how many clients are listening, encoded once when it
+//! is pushed, and the last few are cached, so skipping back and forth doesn't refetch.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -125,86 +145,52 @@ use librespot::{
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
+#[cfg(feature = "airplay")]
+use tokio::net::UdpSocket;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::mpsc,
+    task::JoinHandle,
+    time::timeout,
+};
 
 /// The address the control API listens on by default.
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:50505";
 
-/// How long a `subscribe` keeps a client on the push list. Clients should refresh it about every
-/// third of that, so that a lost keepalive doesn't cost them their subscription.
-pub const SUBSCRIPTION_LEASE: Duration = Duration::from_secs(30);
-
-/// Incoming datagrams larger than this are truncated. Commands are short, only `setvol` carries a
-/// payload. Answers are not bound by this — one carrying a cover runs to tens of kB.
-const MAX_DATAGRAM_SIZE: usize = 1024;
-
-/// Raw bytes per `cover` chunk: as much picture as fits in one Ethernet frame once base64 has
-/// grown it by a third and [`COVER_CHUNK_ENVELOPE_BYTES`] of JSON is wrapped around it.
+/// How many messages may be waiting for one client before its connection is dropped.
 ///
-/// Derived rather than picked, so the two cannot drift apart; `chunk_datagrams_fit_one_frame`
-/// checks the envelope estimate the derivation rests on.
+/// The queue is what keeps a client from reaching the server task at all: the loop enqueues and
+/// moves on, and a writer task of its own does the blocking. Sixteen is far more slack than a
+/// client on a LAN needs — the kernel's own send buffer already absorbs a burst several times
+/// this size — so a full queue is not a busy client but one that has stopped reading. See the
+/// module docs on why that ends the connection instead of skipping an event.
+const CONNECTION_QUEUE: usize = 16;
+
+/// The longest request line accepted, newline included.
 ///
-/// This does not make a picture likelier to arrive on its own: base64 and the envelope cost the
-/// same fraction whatever the split, so a given cover takes about the same number of *packets*
-/// either way, and a client re-asks for the whole picture on any loss regardless. What it removes
-/// is IP fragmentation, which at the previous 3 kB turned every chunk into three fragments and
-/// brought its own ways to fail — reassembly-queue pressure on the receiver with hundreds of
-/// datagrams in flight, consumer routers and tunnels that drop fragments outright, and a receive
-/// buffer that holds far fewer datagrams because each costs three buffers' worth of accounting.
+/// Commands are short and only `setvol` carries a payload, so this is roomy. It exists because a
+/// stream has no natural message boundary: without a cap, a peer that never sends a newline would
+/// have this process buffer whatever it feels like sending, and this process is what plays the
+/// music.
+const MAX_REQUEST_BYTES: u64 = 1024;
+
+/// A cover past this is refused rather than held.
 ///
-/// (Not to be confused with the 9216-byte cap macOS puts on a datagram handed to `sendto`,
-/// `net.inet.udp.maxdgram`. That bounds what the local stack accepts; it says nothing about what
-/// crosses the network in one piece.)
-const COVER_CHUNK_BYTES: usize = ((MTU_UDP_PAYLOAD - COVER_CHUNK_ENVELOPE_BYTES) / 4) * 3;
-
-/// What [`Event::CoverChunk`]'s JSON costs around the base64 at its worst: the longest mime
-/// [`cover_mime`] reports, four digits each of `index` and `count` (a cover of
-/// [`MAX_COVER_BYTES`] does not reach five), and `"pending":false`, the longer of the two values
-/// that field takes. Only used to size [`COVER_CHUNK_BYTES`], and only right as long as the
-/// event's shape is — which is what `chunk_datagrams_fit_one_frame` checks.
-const COVER_CHUNK_ENVELOPE_BYTES: usize = 109;
-
-/// What a UDP payload has to stay inside to cross an Ethernet or Wi-Fi link as one packet: 1500
-/// bytes of MTU less 20 of IP header and 8 of UDP header. Past this the kernel splits the datagram
-/// into IP fragments, and losing any one of them loses the whole datagram — see
-/// [`COVER_CHUNK_BYTES`].
-const MTU_UDP_PAYLOAD: usize = 1472;
-
-/// How many chunks go out back to back before the send pauses to let the client catch up.
+/// It stopped being about what a datagram can carry and now earns its place twice over. It is the
+/// only bound on memory here: an AirPlay sender pushes artwork over DMAP and this process believes
+/// what it is told, so without a cap a malfunctioning one decides how much a Pi holds — times
+/// [`COVER_CACHE_SIZE`], plus the base64 built for each client that asks. And it is the figure a
+/// client sizes its line buffer from, since "read until newline" is only safe with a limit and the
+/// limit has to come from somewhere (see the module docs, and `the_longest_line_is_bounded`).
 ///
-/// Nothing here retransmits, so a chunk the client's socket buffer had no room for is a chunk the
-/// picture never gets. See [`COVER_BURST_PAUSE`].
-const COVER_CHUNK_BURST: usize = 8;
-
-/// How long the `cover` answer pauses between bursts of [`COVER_CHUNK_BURST`] chunks.
-///
-/// A receive buffer holds tens of datagrams, not hundreds: Linux clamps whatever a client asks for
-/// to `net.core.rmem_max`, ~208 kB by default. Firing a whole picture's worth of chunks in one
-/// tight loop overruns that before the client can drain it, and since nothing is retransmitted the
-/// client re-asks and loses the same race again — a cover that never arrives, no matter how often
-/// it is requested. Eight chunks per millisecond is far below what a client drains and still puts
-/// even the largest picture on the wire in well under a second.
-const COVER_BURST_PAUSE: Duration = Duration::from_millis(1);
-
-/// A cover past this is refused rather than sent. This is the bound on what is *accepted*, before
-/// [`shrink_cover`] cuts it down — a sender that pushes more than a couple of megabytes of artwork
-/// is malfunctioning, not being generous.
+/// A couple of megabytes of artwork is a sender malfunctioning, not being generous. Everything
+/// under it is held and sent exactly as it arrived, so what a client gets is what the source
+/// published.
 pub const MAX_COVER_BYTES: usize = 2 * 1024 * 1024;
-
-/// Above this, a cover is re-encoded smaller before it is held. Below it, the bytes are kept
-/// exactly as they arrived.
-///
-/// Spotify's largest cover sits far under this, so that path never re-encodes. AirPlay senders are
-/// the reason this exists: iTunes on Windows pushes the artwork at full size — 1.4 MB of PNG
-/// observed — which is twenty times more picture than a client on this LAN displays.
-const COVER_SHRINK_ABOVE_BYTES: usize = 256 * 1024;
-
-/// The longest edge a re-encoded cover is scaled down to. Not scaled *up*: a picture already
-/// smaller than this only gets re-encoded, never stretched.
-const COVER_MAX_EDGE: u32 = 640;
-
-/// JPEG quality a re-encoded cover is written at.
-const COVER_JPEG_QUALITY: u8 = 85;
 
 /// How long a cover fetch may take before the track event goes out without it.
 const COVER_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -396,16 +382,14 @@ enum ApiServerCommand {
 
 /// A cover prepared off the loop, on its way back to the task that asked for it.
 struct CoverFetched {
-    /// The url it was fetched from, which is what the cache keys on. `None` for a cover that came
-    /// from an AirPlay sender: it was pushed rather than fetched, so there is nothing to key on and
-    /// nothing to re-fetch later.
-    url: Option<String>,
+    /// The url it was fetched from, which is what the cache keys on.
+    url: String,
     /// `None` when it could not be produced; the track then simply has no picture to ask for.
     cover: Option<Cover>,
 }
 
-/// A cover as it is held and sent: raw bytes, base64-encoded one chunk at a time by the `cover`
-/// command rather than all at once.
+/// A cover as it is held: raw bytes, base64-encoded only when the `cover` command asks for it, so
+/// a picture nobody asks about is never encoded at all.
 #[derive(Debug, Clone)]
 struct Cover {
     bytes: Vec<u8>,
@@ -421,7 +405,7 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
-    /// Binds the control socket and spawns the server task.
+    /// Binds the listening socket and spawns the server task.
     ///
     /// Binding happens before the task is spawned, so a failure to take the port is reported
     /// here instead of getting lost in the background.
@@ -429,13 +413,12 @@ impl ApiServer {
         config: ApiServerConfig,
         player_events: PlayerEventChannel,
     ) -> Result<ApiServer, ApiServerError> {
-        let socket =
-            UdpSocket::bind(&config.bind_addr)
-                .await
-                .map_err(|source| ApiServerError::Bind {
-                    addr: config.bind_addr.clone(),
-                    source,
-                })?;
+        let listener = TcpListener::bind(&config.bind_addr)
+            .await
+            .map_err(|source| ApiServerError::Bind {
+                addr: config.bind_addr.clone(),
+                source,
+            })?;
 
         info!("API server listening on {}", config.bind_addr);
 
@@ -445,6 +428,7 @@ impl ApiServer {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (cover_tx, cover_rx) = mpsc::unbounded_channel();
+        let (conn_tx, conn_rx) = mpsc::unbounded_channel();
 
         // An ephemeral port is all this needs, and failing to get one only costs the fallback —
         // not a reason to refuse to start the API.
@@ -459,19 +443,21 @@ impl ApiServer {
 
         let task = tokio::spawn(
             ApiServerTask {
-                socket,
+                listener,
                 allow_list: config.allow_list,
                 spirc: None,
                 session: None,
                 cmd_rx,
                 player_events,
-                subscribers: HashMap::new(),
+                connections: HashMap::new(),
+                next_connection_id: 0,
+                conn_tx,
+                conn_rx,
                 current_track: TrackResponse::default(),
                 current_volume: VolumeResponse::default(),
                 playback: PlaybackState::default(),
                 covers: CoverCache::default(),
                 current_cover: None,
-                cover_pending: false,
                 cover_tx,
                 cover_rx,
                 #[cfg(feature = "airplay")]
@@ -563,25 +549,14 @@ enum Event<'a> {
     VolumeChanged {
         volume: u16,
     },
-    /// A cover for the current track is now held and can be asked for with `cover`. Carries the
-    /// size so a client can decide whether it wants it, not the picture itself.
-    CoverAvailable {
-        mime: &'static str,
-        bytes: usize,
-    },
-    /// One chunk of an answer to `cover`, `index` of `count`.
+    /// The cover of whatever is playing: the whole picture, base64, in one line.
     ///
-    /// `count: 0` means there is no picture to send, and `pending` says why: `true` while the
-    /// cover for the current track is still being fetched — ask again once `cover_available`
-    /// arrives — and `false` when this track simply has no cover, which is final. Without it a
-    /// client cannot tell "none" from "not yet", and the two need opposite responses.
-    ///
-    /// Chunks that carry picture always report `pending: false`: the answer is right here.
-    CoverChunk {
+    /// Pushed when a picture arrives, and to a client that has just subscribed while something is
+    /// already playing. It only ever goes out with a picture in it — a track with no cover simply
+    /// never produces one, and `track_changed` is what tells a client to drop the old artwork.
+    Cover {
         mime: &'a str,
-        index: usize,
-        count: usize,
-        pending: bool,
+        bytes: usize,
         data: String,
     },
 }
@@ -699,87 +674,6 @@ fn cover_mime(bytes: &[u8]) -> &'static str {
     }
 }
 
-/// Cuts an oversized cover down to something a client can actually receive, leaving anything
-/// already small enough exactly as it arrived.
-///
-/// The `cover` command splits a picture into datagrams and retransmits none of them, so the size
-/// of the picture decides whether it arrives at all — see [`COVER_BURST_PAUSE`]. Pacing keeps a
-/// reasonable picture intact; a 1.4 MB PNG is not a reasonable picture, and shrinking it is the
-/// only thing that makes it deliverable rather than merely slower to lose.
-///
-/// Anything that goes wrong — a format neither decoder handles, a corrupt body, a failed encode —
-/// keeps the original bytes. A big cover the client may fail to reassemble beats no cover.
-///
-/// CPU-bound, and slow enough on a Pi to matter: call it off the server task's loop.
-fn shrink_cover(cover: Cover) -> Cover {
-    if cover.bytes.len() <= COVER_SHRINK_ABOVE_BYTES {
-        return cover;
-    }
-
-    let image = match image::load_from_memory(&cover.bytes) {
-        Ok(image) => image,
-        Err(e) => {
-            warn!(
-                "could not decode the {}-byte {} cover to shrink it: {e}",
-                cover.bytes.len(),
-                cover.mime
-            );
-            return cover;
-        }
-    };
-
-    // `resize` fits inside the bounds and would happily scale a smaller picture up; a cover this
-    // big because of how it was encoded rather than how large it is only needs the re-encode.
-    let image = if image.width() > COVER_MAX_EDGE || image.height() > COVER_MAX_EDGE {
-        image.resize(
-            COVER_MAX_EDGE,
-            COVER_MAX_EDGE,
-            image::imageops::FilterType::Triangle,
-        )
-    } else {
-        image
-    };
-
-    let mut bytes = Vec::new();
-    let encoded =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, COVER_JPEG_QUALITY)
-            .encode_image(&image.to_rgb8());
-
-    if let Err(e) = encoded {
-        warn!("could not re-encode the cover: {e}");
-        return cover;
-    }
-
-    debug!(
-        "shrank a {}-byte {} cover to {} bytes of JPEG, {}x{}",
-        cover.bytes.len(),
-        cover.mime,
-        bytes.len(),
-        image.width(),
-        image.height()
-    );
-
-    Cover {
-        bytes,
-        mime: "image/jpeg",
-    }
-}
-
-/// [`shrink_cover`] on a blocking thread, since decoding and re-encoding a megabyte of PNG takes
-/// long enough on a Pi to be worth keeping off an async worker.
-///
-/// `None` only when the blocking thread itself failed, which takes the cover with it — the picture
-/// is then simply absent, the same as any other cover that could not be produced.
-async fn shrink_cover_off_thread(cover: Cover) -> Option<Cover> {
-    match tokio::task::spawn_blocking(move || shrink_cover(cover)).await {
-        Ok(cover) => Some(cover),
-        Err(e) => {
-            warn!("shrinking the cover failed: {e}");
-            None
-        }
-    }
-}
-
 /// Fetches a cover and hands it back to the server task.
 ///
 /// Runs off the task's loop, which has to keep answering commands meanwhile. Always reports back,
@@ -788,7 +682,7 @@ async fn fetch_cover(session: Session, url: String, cover_tx: mpsc::UnboundedSen
     let cover = match timeout(COVER_FETCH_TIMEOUT, session.spclient().request_url(&url)).await {
         Ok(Ok(bytes)) if bytes.len() > MAX_COVER_BYTES => {
             warn!(
-                "cover {url} is {} bytes, too big to put in a datagram",
+                "cover {url} is {} bytes, past the {MAX_COVER_BYTES}-byte limit",
                 bytes.len()
             );
             None
@@ -796,11 +690,10 @@ async fn fetch_cover(session: Session, url: String, cover_tx: mpsc::UnboundedSen
         Ok(Ok(bytes)) => {
             debug!("fetched {} bytes of cover from {url}", bytes.len());
 
-            shrink_cover_off_thread(Cover {
+            Some(Cover {
                 mime: cover_mime(&bytes),
                 bytes: bytes.to_vec(),
             })
-            .await
         }
         Ok(Err(e)) => {
             warn!("could not fetch the cover {url}: {e}");
@@ -813,10 +706,7 @@ async fn fetch_cover(session: Session, url: String, cover_tx: mpsc::UnboundedSen
     };
 
     // the receiver lives as long as the server task, which is what spawned this
-    let _ = cover_tx.send(CoverFetched {
-        url: Some(url),
-        cover,
-    });
+    let _ = cover_tx.send(CoverFetched { url, cover });
 }
 
 /// The last few covers, so that skipping back and forth doesn't refetch them.
@@ -926,16 +816,49 @@ impl PlaybackState {
     }
 }
 
+/// One connected client.
+///
+/// The loop never touches the socket: it hands a line to `tx` and a writer task of its own does
+/// the waiting. Dropping this closes the connection — see [`ApiServerTask::disconnect`].
+struct Connection {
+    peer: SocketAddr,
+    tx: mpsc::Sender<String>,
+    /// Whether it asked for pushes. A connection is not a subscription: a client may just as well
+    /// connect, ask `status` and leave.
+    subscribed: bool,
+}
+
+/// What a connection's reader task tells the server task about.
+enum ConnectionEvent {
+    Request {
+        id: u64,
+        line: String,
+    },
+    /// The peer closed the connection, or reading from it failed.
+    Closed {
+        id: u64,
+    },
+}
+
 struct ApiServerTask {
-    socket: UdpSocket,
+    listener: TcpListener,
     allow_list: AllowList,
     spirc: Option<Spirc>,
     /// What covers are fetched with. `None` until the first connect.
     session: Option<Session>,
     cmd_rx: mpsc::UnboundedReceiver<ApiServerCommand>,
     player_events: PlayerEventChannel,
-    /// Subscribed clients and when their lease runs out.
-    subscribers: HashMap<SocketAddr, Instant>,
+    /// Every client currently connected, by the id [`Self::admit`] gave it.
+    ///
+    /// Keyed by an id of its own rather than by peer address: a client that reconnects can land on
+    /// the same ephemeral port it just used, and its old connection's `Closed` would then arrive
+    /// after the new one registered and unregister the live connection.
+    connections: HashMap<u64, Connection>,
+    next_connection_id: u64,
+    /// Both ends of the connection-event channel, so the loop ends on `cmd_rx` closing rather than
+    /// on the last client leaving.
+    conn_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    conn_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
     current_track: TrackResponse,
     current_volume: VolumeResponse,
     playback: PlaybackState,
@@ -945,13 +868,6 @@ struct ApiServerTask {
     /// The cover of whatever is playing, once there is one. Never part of a track event or any
     /// other response — a client asks for it with `cover` and gets it in chunks.
     current_cover: Option<Cover>,
-    /// Whether a fetch (or an off-loop shrink) for the current track's cover is still running.
-    ///
-    /// Reported as `pending` on the `count: 0` answer, which is the whole reason it is tracked:
-    /// it is what lets a client tell "this track has no cover" from "the picture isn't here
-    /// yet". Set for exactly as long as something is on its way — every path that ends a wait
-    /// clears it, so a client is never told to keep waiting for something that isn't coming.
-    cover_pending: bool,
     cover_tx: mpsc::UnboundedSender<CoverFetched>,
     cover_rx: mpsc::UnboundedReceiver<CoverFetched>,
     /// `None` until `set_airplay_events` hands one over (or forever, if AirPlay isn't running at
@@ -985,13 +901,10 @@ struct ApiServerTask {
     /// Where the helper listens on that address; `None` disables the fallback entirely.
     #[cfg(feature = "airplay")]
     airplay_helper_port: Option<u16>,
-    /// A socket of its own for talking to the helper, rather than the API's.
-    ///
-    /// Not tidiness: a helper answers what it is sent, and anything arriving on `socket` is parsed
-    /// as a command — so forwarding from there fed the helper's `ok` straight back into
-    /// `handle_request`, which logged it and warned about an unknown command. Sending from a
-    /// separate socket makes that structurally impossible instead of relying on the far end
-    /// staying silent. Nothing ever reads this socket; the replies are meant to be dropped.
+    /// The socket commands are forwarded to the helper on. The API itself speaks TCP; this is the
+    /// one thing here that still sends a datagram, since the helper is a small script that listens
+    /// for one. Nothing ever reads it — a helper answers what it is sent, and that answer is meant
+    /// to be dropped.
     #[cfg(feature = "airplay")]
     helper_socket: Option<UdpSocket>,
     /// Set alongside `airplay_events`. What `setvol` acts on while AirPlay is the source: an
@@ -1033,13 +946,88 @@ async fn recv_airplay_event(
     }
 }
 
+/// Reads one connection's requests and forwards them to the server task, a line at a time.
+///
+/// Ends on end of stream, on a read error, or on a line past [`MAX_REQUEST_BYTES`] — and always
+/// reports [`ConnectionEvent::Closed`], so the server task forgets the connection however it went
+/// away.
+async fn read_connection(
+    read: OwnedReadHalf,
+    id: u64,
+    events: mpsc::UnboundedSender<ConnectionEvent>,
+) {
+    let mut reader = BufReader::new(read);
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+
+        // Bounded rather than plain `lines()`: the limit is what a stream doesn't give for free,
+        // and without one a peer that sends no newline decides how much this process buffers. The
+        // `take` is rebuilt each round, so the limit is per line rather than per connection.
+        let read = (&mut reader)
+            .take(MAX_REQUEST_BYTES)
+            .read_until(b'\n', &mut line)
+            .await;
+
+        match read {
+            Ok(0) => break,
+            // no newline within the limit: either an overlong line or a peer that left mid-request
+            Ok(_) if !line.ends_with(b"\n") => {
+                debug!(
+                    "connection {id} ended after {} bytes of request",
+                    line.len()
+                );
+                break;
+            }
+            Ok(_) => {
+                let request = String::from_utf8_lossy(&line).trim().to_string();
+
+                // clients send a bare newline as a poor man's keepalive; nothing to do about it
+                if request.is_empty() {
+                    continue;
+                }
+
+                if events
+                    .send(ConnectionEvent::Request { id, line: request })
+                    .is_err()
+                {
+                    // the server task is gone, so there is nobody left to report to either
+                    return;
+                }
+            }
+            Err(e) => {
+                debug!("could not read from connection {id}: {e}");
+                break;
+            }
+        }
+    }
+
+    let _ = events.send(ConnectionEvent::Closed { id });
+}
+
+/// Writes one connection's queued lines, and does all the waiting a slow client causes.
+///
+/// Ends when the queue closes, which is what [`ApiServerTask::disconnect`] does. The read half
+/// lives in its own task, so this has to shut the socket down explicitly — otherwise dropping a
+/// [`Connection`] would only close half of it, and the client would sit there reading nothing.
+async fn write_connection(mut write: OwnedWriteHalf, mut lines: mpsc::Receiver<String>) {
+    while let Some(line) = lines.recv().await {
+        if let Err(e) = write.write_all(line.as_bytes()).await {
+            debug!("could not write to a client: {e}");
+            break;
+        }
+    }
+
+    let _ = write.shutdown().await;
+}
+
 impl ApiServerTask {
     /// Two full definitions rather than `#[cfg]`s inside one `select!`: per-branch `#[cfg]`,
     /// though documented as supported, fails with a macro-parse error for this branch shape on
     /// the pinned `tokio`.
     #[cfg(feature = "airplay")]
     async fn run(mut self) {
-        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
         // the player outlives this task, but don't spin on a closed channel if it doesn't
         let mut player_events_open = true;
 
@@ -1060,7 +1048,7 @@ impl ApiServerTask {
                     None => break,
                 },
                 // this task holds the sender, so the channel cannot close under it
-                Some(fetched) = self.cover_rx.recv() => self.handle_cover(fetched).await,
+                Some(fetched) = self.cover_rx.recv() => self.handle_cover(fetched),
                 event = self.player_events.recv(), if player_events_open => match event {
                     Some(event) => self.handle_player_event(event).await,
                     None => {
@@ -1075,9 +1063,14 @@ impl ApiServerTask {
                         self.airplay_events = None;
                     }
                 },
-                received = self.socket.recv_from(&mut buf) => match received {
-                    Ok((len, peer)) => self.handle_request(&buf[..len], peer).await,
-                    Err(e) => warn!("could not receive on the API socket: {e}"),
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, peer)) => self.accept(stream, peer),
+                    Err(e) => warn!("could not accept an API connection: {e}"),
+                },
+                // likewise held by this task, so it cannot close under it
+                Some(event) = self.conn_rx.recv() => match event {
+                    ConnectionEvent::Request { id, line } => self.handle_request(&line, id).await,
+                    ConnectionEvent::Closed { id } => self.disconnect(id),
                 },
             }
         }
@@ -1087,7 +1080,6 @@ impl ApiServerTask {
     /// than one `#[cfg]`-laden body — identical except for the one AirPlay-events branch.
     #[cfg(not(feature = "airplay"))]
     async fn run(mut self) {
-        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
         let mut player_events_open = true;
 
         loop {
@@ -1100,7 +1092,7 @@ impl ApiServerTask {
                     }
                     None => break,
                 },
-                Some(fetched) = self.cover_rx.recv() => self.handle_cover(fetched).await,
+                Some(fetched) = self.cover_rx.recv() => self.handle_cover(fetched),
                 event = self.player_events.recv(), if player_events_open => match event {
                     Some(event) => self.handle_player_event(event).await,
                     None => {
@@ -1108,11 +1100,72 @@ impl ApiServerTask {
                         player_events_open = false;
                     }
                 },
-                received = self.socket.recv_from(&mut buf) => match received {
-                    Ok((len, peer)) => self.handle_request(&buf[..len], peer).await,
-                    Err(e) => warn!("could not receive on the API socket: {e}"),
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, peer)) => self.accept(stream, peer),
+                    Err(e) => warn!("could not accept an API connection: {e}"),
+                },
+                Some(event) = self.conn_rx.recv() => match event {
+                    ConnectionEvent::Request { id, line } => self.handle_request(&line, id).await,
+                    ConnectionEvent::Closed { id } => self.disconnect(id),
                 },
             }
+        }
+    }
+
+    /// Takes a connection the allow list lets in and sets its two tasks going, or drops it on the
+    /// floor — which closes it, and is the whole answer a rejected peer gets.
+    fn accept(&mut self, stream: TcpStream, peer: SocketAddr) {
+        let (id, lines) = match self.admit(peer) {
+            Some(admitted) => admitted,
+            None => return,
+        };
+
+        // every line here is small and worth sending the moment it exists; there is no stream of
+        // bulk data for Nagle to coalesce, only latency for it to add
+        if let Err(e) = stream.set_nodelay(true) {
+            debug!("could not disable Nagle for {peer}: {e}");
+        }
+
+        let (read, write) = stream.into_split();
+        tokio::spawn(write_connection(write, lines));
+        tokio::spawn(read_connection(read, id, self.conn_tx.clone()));
+    }
+
+    /// Registers a connection and hands back its id and the queue its writer task drains, or
+    /// `None` when the peer is not on the allow list.
+    ///
+    /// The allow list is checked once here rather than per request, which is the one thing a
+    /// stream makes cheaper than datagrams did: a peer that isn't welcome is refused at the
+    /// connection and logged once, instead of on every message it sends.
+    fn admit(&mut self, peer: SocketAddr) -> Option<(u64, mpsc::Receiver<String>)> {
+        if !self.allow_list.allows(peer.ip()) {
+            warn!("rejecting a connection from {peer}: not on the allow list");
+            return None;
+        }
+
+        let id = self.next_connection_id;
+        self.next_connection_id += 1;
+
+        let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
+        self.connections.insert(
+            id,
+            Connection {
+                peer,
+                tx,
+                subscribed: false,
+            },
+        );
+
+        info!("{peer} connected to the API");
+
+        Some((id, rx))
+    }
+
+    /// Forgets a connection, which closes it: dropping the [`Connection`] drops the queue's
+    /// sender, the writer task's loop ends, and its `shutdown` takes the socket down with it.
+    fn disconnect(&mut self, id: u64) {
+        if let Some(connection) = self.connections.remove(&id) {
+            info!("{} disconnected from the API", connection.peer);
         }
     }
 
@@ -1129,29 +1182,26 @@ impl ApiServerTask {
 
                 self.current_track = TrackResponse::from(*audio_item);
                 self.load_cover(cover_url);
-                self.announce_track().await;
+                self.announce_track();
             }
             PlayerEvent::Playing { position_ms, .. } => {
                 #[cfg(feature = "airplay")]
                 {
                     self.active_source = Source::Spotify;
                 }
-                self.update_playback(Some(true), position_ms).await
+                self.update_playback(Some(true), position_ms)
             }
             PlayerEvent::Paused { position_ms, .. } => {
-                self.update_playback(Some(false), position_ms).await
+                self.update_playback(Some(false), position_ms)
             }
-            PlayerEvent::Stopped { .. } => self.update_playback(Some(false), 0).await,
+            PlayerEvent::Stopped { .. } => self.update_playback(Some(false), 0),
             // a seek or a drift correction moves the position without touching play / pause
             PlayerEvent::Seeked { position_ms, .. }
             | PlayerEvent::PositionCorrection { position_ms, .. }
-            | PlayerEvent::Loading { position_ms, .. } => {
-                self.update_playback(None, position_ms).await
-            }
+            | PlayerEvent::Loading { position_ms, .. } => self.update_playback(None, position_ms),
             PlayerEvent::VolumeChanged { volume } => {
                 self.current_volume.volume = volume;
-                self.broadcast(encode(&Event::VolumeChanged { volume }))
-                    .await;
+                self.broadcast(encode(&Event::VolumeChanged { volume }));
             }
             // Nobody is connected to this device on Spotify any more. What it was reporting
             // describes a session that is over, so it goes — see [`Self::clear_now_playing`].
@@ -1162,7 +1212,7 @@ impl ApiServerTask {
                     return;
                 }
                 debug!("Spotify disconnected: clearing what it was playing");
-                self.clear_now_playing().await;
+                self.clear_now_playing();
             }
             _ => (),
         }
@@ -1176,13 +1226,11 @@ impl ApiServerTask {
     /// so nothing special is needed to display it.
     ///
     /// The volume is left alone: it belongs to this device's output, not to whoever was playing.
-    async fn clear_now_playing(&mut self) {
+    fn clear_now_playing(&mut self) {
         self.current_track = TrackResponse::default();
         self.current_cover = None;
-        // nothing is playing, so nothing is on its way either
-        self.cover_pending = false;
-        self.announce_track().await;
-        self.update_playback(Some(false), 0).await;
+        self.announce_track();
+        self.update_playback(Some(false), 0);
     }
 
     /// Is this the AirPlay session whose state this server publishes? AirPlay writes through the
@@ -1263,7 +1311,7 @@ impl ApiServerTask {
                 // `playstatusupdate` without `cant`/`cast`) — the same "don't know" sentinel
                 // every other unavailable field here uses. A sender that pushes `progress:`
                 // corrects it within moments anyway.
-                self.update_playback(Some(is_playing), position_ms).await;
+                self.update_playback(Some(is_playing), position_ms);
             }
             AirplayEvent::TrackChanged {
                 connection,
@@ -1300,12 +1348,14 @@ impl ApiServerTask {
                     is_explicit: false,
                     source: "airplay".to_string(),
                 };
-                self.announce_track().await;
+                self.announce_track();
 
                 // The DACP path fetches the picture before reporting the track, so it arrives
-                // here; the push path sends it as its own request moments later.
+                // here; the push path sends it as its own request moments later. Either way the
+                // sender handed over the bytes, so there is nothing to wait for and nothing to
+                // cache it under — it is simply held.
                 if let Some((bytes, mime)) = cover {
-                    self.load_airplay_cover(Cover { bytes, mime }).await;
+                    self.announce_cover(Cover { bytes, mime });
                 }
             }
             AirplayEvent::CoverChanged {
@@ -1332,7 +1382,7 @@ impl ApiServerTask {
                     );
                     return;
                 }
-                self.load_airplay_cover(Cover { bytes, mime }).await;
+                self.announce_cover(Cover { bytes, mime });
             }
             AirplayEvent::ProgressChanged {
                 connection,
@@ -1353,7 +1403,7 @@ impl ApiServerTask {
                 }
                 // Position only — `None` leaves play/pause alone, since a sender pushes progress
                 // while paused too.
-                self.update_playback(None, position_ms).await;
+                self.update_playback(None, position_ms);
             }
             AirplayEvent::VolumeChanged {
                 connection,
@@ -1369,8 +1419,7 @@ impl ApiServerTask {
                 debug!("AirPlay volume (connection {connection}): {percent}%");
                 let volume = volume_from_percent(percent);
                 self.current_volume.volume = volume;
-                self.broadcast(encode(&Event::VolumeChanged { volume }))
-                    .await;
+                self.broadcast(encode(&Event::VolumeChanged { volume }));
             }
             AirplayEvent::SessionEnded { connection } => {
                 // Named connection only: another session may already have taken over.
@@ -1386,7 +1435,7 @@ impl ApiServerTask {
                 // not wipe Spotify's track.
                 if was_on_the_air {
                     debug!("AirPlay connection {connection} ended: clearing what it was playing");
-                    self.clear_now_playing().await;
+                    self.clear_now_playing();
                 }
 
                 // The DACP endpoint deliberately **survives** its session, exactly as in
@@ -1407,25 +1456,27 @@ impl ApiServerTask {
         }
     }
 
-    /// Starts fetching the cover of the track that just changed, if it isn't already held.
+    /// Starts fetching the cover of the track that just changed, or pushes it straight out if it
+    /// is already held.
     ///
-    /// The track event does **not** wait for it: covers travel only in answer to a `cover`
-    /// request now, so there is nothing to hold the announcement for. A client learns the picture
-    /// arrived from [`Event::CoverAvailable`] and asks for it when it wants it.
+    /// The track event does **not** wait for it — see the module docs on why the two are separate
+    /// events. Whichever way the picture turns up, subscribers are sent it without asking.
     ///
-    /// Every exit sets `cover_pending`, and only the spawning one sets it true: a cover served
-    /// from the cache, a track with no artwork and a missing session are all cases where nothing
-    /// further is coming, and a client asking now deserves a final answer rather than being told
-    /// to wait for a fetch that will never report back.
+    /// Clearing `current_cover` first is what makes a track with no artwork, an unreachable one,
+    /// or a fetch that never lands all look the same from outside: no `cover` event follows the
+    /// `track_changed`, and the client's own artwork stays cleared. Nothing has to report a
+    /// negative.
     fn load_cover(&mut self, url: Option<String>) {
         self.current_cover = None;
-        self.cover_pending = false;
 
         let Some(url) = url else {
             return;
         };
         if let Some(cover) = self.covers.get(&url).cloned() {
-            self.current_cover = Some(cover);
+            // Straight to `announce_cover`, not just into the field: a cache hit is a picture
+            // arriving as much as a fetch is, and skipping back to a track whose cover is still
+            // held must not leave subscribers with nothing.
+            self.announce_cover(cover);
             return;
         }
         let Some(session) = self.session.clone() else {
@@ -1434,158 +1485,93 @@ impl ApiServerTask {
             return;
         };
 
-        self.cover_pending = true;
         tokio::spawn(fetch_cover(session, url, self.cover_tx.clone()));
     }
 
-    /// Takes a fetched cover and tells subscribers it is there to be asked for.
+    /// Takes a fetched cover and pushes it to subscribers.
     ///
-    /// Reports back on every outcome, failure and timeout included, which is what makes this the
-    /// one place `cover_pending` has to be cleared: past here nothing is on its way any more, and
-    /// a `count: 0` answer stops meaning "wait".
-    async fn handle_cover(&mut self, fetched: CoverFetched) {
-        self.cover_pending = false;
-
+    /// A fetch that failed or timed out reports back too, carrying no cover, and there is nothing
+    /// to do about it: no event goes out, and the client keeps showing nothing, which is what it
+    /// has shown since `track_changed`.
+    fn handle_cover(&mut self, fetched: CoverFetched) {
         // worth keeping even if a newer track overtook this fetch: whatever overtook it was most
         // likely a skip, and a skip back wants this picture again
         let Some(cover) = fetched.cover else {
             return;
         };
-        // an AirPlay sender's own artwork has no url to key on, and it pushes it again anyway
-        if let Some(url) = fetched.url {
-            self.covers.insert(url, cover.clone());
-        }
 
-        self.announce_cover(cover).await;
+        self.covers.insert(fetched.url, cover.clone());
+        self.announce_cover(cover);
     }
 
-    /// Takes a cover an AirPlay sender pushed: held right away when it is small enough, shrunk
-    /// off the loop first when it isn't.
+    /// Holds a cover for the current track and pushes it to subscribers.
     ///
-    /// Nothing was fetched here — the sender handed over the bytes — so this is where the size
-    /// decision happens for that path. A shrink reports back through the same channel
-    /// [`fetch_cover`] uses, carrying no url, since there is nothing to cache it under.
-    #[cfg(feature = "airplay")]
-    async fn load_airplay_cover(&mut self, cover: Cover) {
-        if cover.bytes.len() <= COVER_SHRINK_ABOVE_BYTES {
-            self.announce_cover(cover).await;
+    /// The picture itself, not a note that one exists: a subscriber is subscribed so that it does
+    /// not have to ask for anything. It is encoded once here however many clients are listening.
+    fn announce_cover(&mut self, cover: Cover) {
+        self.current_cover = Some(cover);
+
+        // Nobody listening means nobody to encode for, and this is the one expensive thing the
+        // task does — worth the check, since a track change reaches here whether or not anyone
+        // subscribed.
+        if !self.has_subscribers() {
             return;
         }
 
-        let cover_tx = self.cover_tx.clone();
-
-        // a shrink is the same kind of wait as a fetch: the picture is not here yet, but it is
-        // coming, and a client asking meanwhile should be told to wait rather than that there is
-        // nothing — it reports back through the same channel, so `handle_cover` clears this
-        self.cover_pending = true;
-
-        tokio::spawn(async move {
-            let cover = shrink_cover_off_thread(cover).await;
-
-            // the receiver lives as long as the server task, which is what spawned this
-            let _ = cover_tx.send(CoverFetched { url: None, cover });
-        });
+        let payload = self.encode_cover();
+        self.broadcast(payload);
     }
 
-    /// Holds a cover for the current track and tells subscribers it can be asked for.
-    async fn announce_cover(&mut self, cover: Cover) {
-        let payload = encode(&Event::CoverAvailable {
+    /// The held cover as the `cover` event, picture and all.
+    ///
+    /// `None` when there is no picture — and then nothing is sent, because there is no such thing
+    /// as an empty `cover` event: a track without artwork simply never produces one.
+    fn encode_cover(&self) -> Option<String> {
+        let cover = self.current_cover.as_ref()?;
+        debug!("sending {} bytes of cover", cover.bytes.len());
+
+        encode(&Event::Cover {
             mime: cover.mime,
             bytes: cover.bytes.len(),
-        });
-        self.current_cover = Some(cover);
-        self.cover_pending = false;
-        self.broadcast(payload).await;
+            data: BASE64.encode(&cover.bytes),
+        })
     }
 
-    /// Answers `cover` with the current picture, split across as many datagrams as it takes.
-    ///
-    /// One response per chunk, in order, each carrying its index and the total — so a client can
-    /// reassemble them and tell a lost one from the end of the picture.
-    ///
-    /// With no picture to send the answer is a single `count: 0`, which is a real answer rather
-    /// than silence — and it carries `pending`, so the client knows whether that is final or
-    /// whether the fetch simply hasn't landed yet. See [`Event::CoverChunk`].
-    ///
-    /// Sent in bursts of [`COVER_CHUNK_BURST`] with a [`COVER_BURST_PAUSE`] between them, so the
-    /// client's receive buffer is never the reason a chunk goes missing.
-    async fn send_cover(&self, peer: SocketAddr) {
-        let Some(cover) = &self.current_cover else {
-            self.reply(
-                &Event::CoverChunk {
-                    mime: "",
-                    index: 0,
-                    count: 0,
-                    pending: self.cover_pending,
-                    data: String::new(),
-                },
-                peer,
-            )
-            .await;
-            return;
-        };
-
-        let chunks: Vec<&[u8]> = cover.bytes.chunks(COVER_CHUNK_BYTES).collect();
-        debug!(
-            "sending {} bytes of cover to {peer} in {} chunks",
-            cover.bytes.len(),
-            chunks.len()
-        );
-        for (index, chunk) in chunks.iter().enumerate() {
-            if index > 0 && index % COVER_CHUNK_BURST == 0 {
-                tokio::time::sleep(COVER_BURST_PAUSE).await;
-            }
-
-            self.reply(
-                &Event::CoverChunk {
-                    mime: cover.mime,
-                    index,
-                    count: chunks.len(),
-                    // the picture is right here, so there is nothing left to wait for
-                    pending: false,
-                    data: BASE64.encode(chunk),
-                },
-                peer,
-            )
-            .await;
-        }
+    fn has_subscribers(&self) -> bool {
+        self.connections
+            .values()
+            .any(|connection| connection.subscribed)
     }
 
-    async fn announce_track(&mut self) {
+    fn announce_track(&mut self) {
         self.broadcast(encode(&Event::TrackChanged {
             track: &self.current_track,
-        }))
-        .await;
+        }));
     }
 
-    async fn update_playback(&mut self, is_playing: Option<bool>, position_ms: u32) {
+    fn update_playback(&mut self, is_playing: Option<bool>, position_ms: u32) {
         self.playback.update(is_playing, position_ms);
 
         self.broadcast(encode(&Event::PlaybackChanged {
             is_playing: self.playback.is_playing,
             position_ms,
-        }))
-        .await;
+        }));
     }
 
-    async fn handle_request(&mut self, datagram: &[u8], peer: SocketAddr) {
-        if !self.allow_list.allows(peer.ip()) {
-            warn!("rejecting a datagram from {peer}: not on the allow list");
+    /// Handles one request line from a connection the allow list already let in.
+    async fn handle_request(&mut self, request: &str, id: u64) {
+        let Some(peer) = self.connections.get(&id).map(|connection| connection.peer) else {
+            // it closed between the read and here, and its `Closed` is right behind this
             return;
-        }
+        };
 
-        let message = String::from_utf8_lossy(datagram);
-        let mut parts = message.trim().splitn(2, ' ');
+        let mut parts = request.splitn(2, ' ');
         let command = parts.next().unwrap_or_default();
         let payload = parts.next().unwrap_or_default().trim();
 
-        // subscription keepalives arrive every lease period, so they stay at `debug`;
-        // everything else is a user-triggered command and is worth seeing without RUST_LOG
-        if matches!(command, "subscribe" | "unsubscribe") {
-            debug!("received '{command}' from {peer}");
-        } else {
-            info!("received '{command}' from {peer}");
-        }
+        // one line per command, and — unlike the lease keepalives this replaced — none of them
+        // arrive on a timer, so all of them are worth seeing without RUST_LOG
+        info!("received '{command}' from {peer}");
 
         match command {
             "next" => self.control(command, Spirc::next, "nextitem").await,
@@ -1612,56 +1598,57 @@ impl ApiServerTask {
                 }
                 Err(e) => warn!("invalid `setvol` payload '{payload}' from {peer}: {e}"),
             },
-            "getvol" => self.reply(&self.current_volume, peer).await,
-            "current_track" => self.reply(&self.current_track, peer).await,
-            "cover" => self.send_cover(peer).await,
-            "status" => self.reply(&self.snapshot(), peer).await,
-            // Also the keepalive: renewing is subscribing again, which costs one small datagram
-            // now that no response carries a picture.
+            "getvol" => self.send(encode(&self.current_volume), id),
+            "current_track" => self.send(encode(&self.current_track), id),
+            "status" => self.send(encode(&self.snapshot()), id),
             "subscribe" => {
-                let is_new = self.renew_lease(peer);
-                self.reply(&self.snapshot(), peer).await;
+                let is_new = self.subscribe(id);
+                self.send(encode(&self.snapshot()), id);
 
-                // A picture that arrived before this client did was announced to whoever was
-                // subscribed at the time, so without this a client joining mid-track has no reason
-                // to send `cover` and shows no artwork until the next track announces a new one.
-                // Only for a genuinely new subscription: a renewal arrives every lease period, and
-                // re-announcing there would have every client refetch the same cover forever.
+                // The picture of whatever is already playing, which went out to whoever was
+                // subscribed when it arrived. Without this a client joining mid-track shows no
+                // artwork until the next track produces a new one — and, since a subscriber sends
+                // nothing but `subscribe`, it would have no way to fix that itself.
+                //
+                // Only for a genuinely new subscription: subscribing twice on one connection must
+                // not resend a picture the client already has.
                 if is_new {
-                    if let Some(cover) = &self.current_cover {
-                        let announcement = Event::CoverAvailable {
-                            mime: cover.mime,
-                            bytes: cover.bytes.len(),
-                        };
-                        self.reply(&announcement, peer).await;
-                    }
+                    let payload = self.encode_cover();
+                    self.send(payload, id);
                 }
             }
-            "unsubscribe" => {
-                if self.subscribers.remove(&peer).is_some() {
-                    info!("{peer} unsubscribed from API events");
-                }
-            }
+            "unsubscribe" => self.unsubscribe(id),
             other => warn!("unknown command '{other}' from {peer}"),
         }
     }
 
-    /// Puts a client on the push list, or keeps it there for another lease.
+    /// Puts a connection on the push list.
     ///
-    /// `true` when this was a new subscription rather than a renewal — the caller uses that to
-    /// tell a first-time subscriber about a cover that is already here, without repeating it on
-    /// every keepalive.
-    fn renew_lease(&mut self, peer: SocketAddr) -> bool {
-        let is_new = self
-            .subscribers
-            .insert(peer, Instant::now() + SUBSCRIPTION_LEASE)
-            .is_none();
+    /// `true` when it wasn't on it already — the caller uses that to tell a first-time subscriber
+    /// about a cover that is already here, without repeating it if it subscribes again.
+    fn subscribe(&mut self, id: u64) -> bool {
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return false;
+        };
 
-        if is_new {
-            info!("{peer} subscribed to API events");
+        if connection.subscribed {
+            return false;
         }
 
-        is_new
+        connection.subscribed = true;
+        info!("{} subscribed to API events", connection.peer);
+
+        true
+    }
+
+    /// Takes a connection off the push list, leaving it open to keep asking things.
+    fn unsubscribe(&mut self, id: u64) {
+        if let Some(connection) = self.connections.get_mut(&id) {
+            if connection.subscribed {
+                connection.subscribed = false;
+                info!("{} unsubscribed from API events", connection.peer);
+            }
+        }
     }
 
     fn snapshot(&self) -> Event<'_> {
@@ -1795,42 +1782,63 @@ impl ApiServerTask {
         self.command(name, |spirc| spirc.set_volume(volume));
     }
 
-    /// Sends an event to every subscriber whose lease is still good.
-    async fn broadcast(&mut self, payload: Option<String>) {
-        let now = Instant::now();
+    /// Sends an event to every subscribed connection.
+    ///
+    /// Takes an already-encoded payload rather than something to serialize, because most events
+    /// borrow from `self` (`&self.current_track`) while this needs `&mut self` to drop whatever
+    /// connections turn out to be gone.
+    fn broadcast(&mut self, payload: Option<String>) {
+        let Some(mut line) = payload else {
+            return;
+        };
+        line.push('\n');
 
-        self.subscribers.retain(|peer, lease| {
-            let alive = *lease > now;
+        // collected so that the sends don't borrow the connection list
+        let subscribed: Vec<u64> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| connection.subscribed)
+            .map(|(id, _)| *id)
+            .collect();
 
-            if !alive {
-                info!("subscription of {peer} expired");
-            }
+        for id in subscribed {
+            self.send_line(line.clone(), id);
+        }
+    }
 
-            alive
-        });
+    /// Answers one connection.
+    ///
+    /// The newline that frames the message is appended in place: the payload is owned already, so
+    /// a cover's base64 is never copied a second time just to be framed.
+    fn send(&mut self, payload: Option<String>, id: u64) {
+        let Some(mut line) = payload else {
+            return;
+        };
+        line.push('\n');
 
-        let Some(payload) = payload else {
+        self.send_line(line, id);
+    }
+
+    /// Queues a line for one connection, or drops the connection if it cannot take it.
+    ///
+    /// Never waits: the queue is what stands between a client that stopped reading and the loop
+    /// that also serves the player. A full one means it isn't draining its socket, and on a stream
+    /// there is no way to skip an event and leave the client's state consistent — so it is told
+    /// the only way that works, by having the connection closed under it.
+    fn send_line(&mut self, line: String, id: u64) {
+        let Some(connection) = self.connections.get(&id) else {
             return;
         };
 
-        // collected so that the sends don't borrow the subscriber list
-        let peers: Vec<SocketAddr> = self.subscribers.keys().copied().collect();
+        let reason = match connection.tx.try_send(line) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(_)) => "it is not keeping up",
+            // the writer task ended, so the socket is already down and `Closed` is on its way
+            Err(mpsc::error::TrySendError::Closed(_)) => "it has gone away",
+        };
 
-        for peer in peers {
-            self.send(&payload, peer).await;
-        }
-    }
-
-    async fn reply<T: Serialize>(&self, response: &T, peer: SocketAddr) {
-        if let Some(payload) = encode(response) {
-            self.send(&payload, peer).await;
-        }
-    }
-
-    async fn send(&self, payload: &str, peer: SocketAddr) {
-        if let Err(e) = self.socket.send_to(payload.as_bytes(), peer).await {
-            warn!("could not send to {peer}: {e}");
-        }
+        warn!("dropping the connection to {}: {reason}", connection.peer);
+        self.disconnect(id);
     }
 }
 
@@ -1858,7 +1866,8 @@ mod tests {
     };
 
     const TRACK_URI: &str = "spotify:track:2WUy2Uywcj5cP0IXQagO3z";
-    /// The one the fixture ships: the smallest at least [`COVER_MIN_WIDTH`] wide.
+    /// A middling one out of what the fixture ships, so a test that names it is not the one
+    /// [`cover_to_ship`] would pick anyway.
     const COVER_URL: &str = "https://i.scdn.co/image/default";
 
     fn artist(name: &str) -> ArtistWithRole {
@@ -1991,106 +2000,92 @@ mod tests {
         assert_eq!(cache.covers.len(), COVER_CACHE_SIZE);
     }
 
-    /// The chunk size is only right in relation to the envelope around it, and the envelope is
-    /// free to grow whenever [`Event::CoverChunk`] changes. Built at its worst: the longest mime
-    /// [`cover_mime`] can report, and the largest indices a cover of [`MAX_COVER_BYTES`] reaches.
+    /// `\n` is the frame boundary, so a payload that contained one would split a message in two
+    /// and leave the client parsing halves. Nothing carries newlines today, but a track title is
+    /// whatever a sender pushed and `serde_json` is what has to keep escaping them.
     #[test]
-    fn chunk_datagrams_fit_one_frame() {
-        let last = MAX_COVER_BYTES.div_ceil(COVER_CHUNK_BYTES);
-        let datagram = encode(&Event::CoverChunk {
+    fn a_payload_never_contains_a_raw_newline() {
+        let track = TrackResponse {
+            song_name: "Sun\nIs\r\nShining".to_string(),
+            album: "Ka\nya".to_string(),
+            ..TrackResponse::default()
+        };
+
+        let payload = encode(&Event::TrackChanged { track: &track }).expect("encodes");
+
+        assert!(!payload.contains('\n'), "{payload}");
+        assert!(!payload.contains('\r'), "{payload}");
+        // and it still round-trips, so the escaping is what keeps it out rather than a mangling
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid json");
+        assert_eq!(parsed["track"]["song_name"], "Sun\nIs\r\nShining");
+    }
+
+    /// The number a client sizes its line buffer from, pinned so it cannot drift out of the docs
+    /// and out of `contrib/api_test.py`.
+    ///
+    /// A client reads until `\n` and needs a limit to do that safely; this is where the limit
+    /// comes from. Built at its worst: a full [`MAX_COVER_BYTES`] of picture and the longest mime
+    /// [`cover_mime`] can report.
+    #[test]
+    fn the_longest_line_is_bounded() {
+        /// What the module docs and `api_test.py` tell clients to allow for.
+        const PUBLISHED: usize = 2_800_000;
+
+        let bytes = vec![0xab; MAX_COVER_BYTES];
+        let payload = encode(&Event::Cover {
             mime: "application/octet-stream",
-            index: last,
-            count: last,
-            // the longer of the two, so the envelope is measured at its worst
-            pending: false,
-            data: BASE64.encode(&vec![0xab; COVER_CHUNK_BYTES]),
+            bytes: bytes.len(),
+            data: BASE64.encode(&bytes),
         })
         .expect("encodes");
 
+        // plus the newline `send` appends, which the client has to read too
+        let line = payload.len() + 1;
+
         assert!(
-            datagram.len() <= MTU_UDP_PAYLOAD,
-            "a chunk datagram is {} bytes and would be fragmented",
-            datagram.len()
+            line <= PUBLISHED,
+            "the longest line is {line} bytes, past the {PUBLISHED} clients are told to allow"
+        );
+        // and not so far under it that the published figure has quietly become nonsense
+        assert!(
+            line > PUBLISHED / 2,
+            "the longest line is only {line} bytes"
         );
     }
 
-    /// A PNG of noise, which barely compresses — the point is to get past
-    /// [`COVER_SHRINK_ABOVE_BYTES`] the way a real sender's full-size artwork does.
-    fn noisy_png(edge: u32) -> Vec<u8> {
-        let pixels = image::RgbImage::from_fn(edge, edge, |x, y| {
-            let seed = x.wrapping_mul(2654435761) ^ y.wrapping_mul(2246822519);
-            image::Rgb([(seed >> 16) as u8, (seed >> 8) as u8, seed as u8])
-        });
-        let mut bytes = Vec::new();
-        image::DynamicImage::ImageRgb8(pixels)
-            .write_to(
-                &mut std::io::Cursor::new(&mut bytes),
-                image::ImageFormat::Png,
-            )
-            .expect("encodes");
+    /// The bytes go out as they came in, whatever they are and however many. There used to be a
+    /// re-encode above 256 kB, which UDP needed and a stream does not; a client gets the artwork,
+    /// not a version of it. Also the biggest line the push path actually produces.
+    #[tokio::test]
+    async fn a_cover_is_sent_exactly_as_it_arrived() {
+        // The size iTunes on Windows pushes, which is what used to be re-encoded. Bytes that vary
+        // rather than a run of one value, so a truncation or a re-encode could not pass unnoticed.
+        let png: Vec<u8> = (0..1_400_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 16) as u8)
+            .collect();
 
-        bytes
-    }
+        let mut server = TestServer::start_with(AllowList::default(), |task| {
+            task.current_cover = Some(Cover {
+                bytes: png.clone(),
+                mime: "image/png",
+            });
+        })
+        .await;
 
-    /// The picture iTunes on Windows pushes is megabytes of PNG, which no amount of pacing gets
-    /// across in one piece. It has to come down in size before it is ever held.
-    #[test]
-    fn an_oversized_cover_is_re_encoded_smaller() {
-        let bytes = noisy_png(1024);
-        assert!(
-            bytes.len() > COVER_SHRINK_ABOVE_BYTES,
-            "the fixture has to be oversized to test anything"
-        );
+        // the only thing a client ever sends, and the picture follows the snapshot
+        server.request("subscribe").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
 
-        let before = bytes.len();
-        let shrunk = shrink_cover(Cover {
-            bytes,
-            mime: "image/png",
-        });
+        let pushed = server.receive().await;
+        assert_eq!(pushed["event"], "cover");
+        assert_eq!(pushed["mime"], "image/png", "the format is not changed");
+        assert_eq!(pushed["bytes"], png.len());
 
-        assert_eq!(shrunk.mime, "image/jpeg");
-        // What is guaranteed is the cap on the picture, not an absolute byte count: how far the
-        // bytes fall is up to the content, and noise is the worst case JPEG ever meets. Real
-        // artwork of this size comes out around 50 kB.
-        assert!(
-            shrunk.bytes.len() < before / 2,
-            "{before} bytes became {}",
-            shrunk.bytes.len()
-        );
+        let received = BASE64
+            .decode(pushed["data"].as_str().expect("base64 text").as_bytes())
+            .expect("valid base64");
 
-        let decoded = image::load_from_memory(&shrunk.bytes).expect("a readable JPEG");
-        assert_eq!(decoded.width(), COVER_MAX_EDGE);
-        assert_eq!(decoded.height(), COVER_MAX_EDGE);
-    }
-
-    /// Everything else is kept byte for byte: Spotify's covers arrive small already, and
-    /// re-encoding one would only cost quality.
-    #[test]
-    fn a_cover_small_enough_to_send_is_left_alone() {
-        let bytes = noisy_png(64);
-        assert!(bytes.len() <= COVER_SHRINK_ABOVE_BYTES);
-
-        let kept = shrink_cover(Cover {
-            bytes: bytes.clone(),
-            mime: "image/png",
-        });
-
-        assert_eq!(kept.mime, "image/png");
-        assert_eq!(kept.bytes, bytes);
-    }
-
-    /// A body no decoder makes sense of is passed through rather than dropped — a picture the
-    /// client may struggle with beats no picture.
-    #[test]
-    fn a_cover_that_cannot_be_decoded_survives_the_shrink() {
-        let bytes = vec![0x5a; COVER_SHRINK_ABOVE_BYTES + 1];
-
-        let kept = shrink_cover(Cover {
-            bytes: bytes.clone(),
-            mime: "application/octet-stream",
-        });
-
-        assert_eq!(kept.bytes, bytes);
+        assert_eq!(received, png, "the picture is not the one that was put in");
     }
 
     #[test]
@@ -2242,11 +2237,11 @@ mod tests {
     }
 
     /// A server task on a loopback port, with the handles a test needs to drive it: the player
-    /// event sender, and a client socket to talk to it with.
+    /// event sender, and a connection to talk to it over.
     struct TestServer {
-        addr: SocketAddr,
         events: mpsc::UnboundedSender<PlayerEvent>,
-        client: UdpSocket,
+        requests: OwnedWriteHalf,
+        responses: BufReader<OwnedReadHalf>,
         /// The task stops when the command channel closes, so hold on to the sender.
         _cmd_tx: mpsc::UnboundedSender<ApiServerCommand>,
     }
@@ -2263,21 +2258,24 @@ mod tests {
         let (events, player_events) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (cover_tx, cover_rx) = mpsc::unbounded_channel();
+        let (conn_tx, conn_rx) = mpsc::unbounded_channel();
 
         let task = ApiServerTask {
-            socket: UdpSocket::bind("127.0.0.1:0").await.expect("binds"),
+            listener: TcpListener::bind("127.0.0.1:0").await.expect("binds"),
             allow_list,
             spirc: None,
             session: None,
             cmd_rx,
             player_events,
-            subscribers: HashMap::new(),
+            connections: HashMap::new(),
+            next_connection_id: 0,
+            conn_tx,
+            conn_rx,
             current_track: TrackResponse::default(),
             current_volume: VolumeResponse::default(),
             playback: PlaybackState::default(),
             covers: CoverCache::default(),
             current_cover: None,
-            cover_pending: false,
             cover_tx,
             cover_rx,
             #[cfg(feature = "airplay")]
@@ -2326,55 +2324,64 @@ mod tests {
         ) -> Self {
             let (mut task, events, cmd_tx) = idle_task(allow_list).await;
             prepare(&mut task);
-            let addr = task.socket.local_addr().expect("has an address");
+            let addr = task.listener.local_addr().expect("has an address");
 
             tokio::spawn(task.run());
 
+            let (read, requests) = TcpStream::connect(addr)
+                .await
+                .expect("connects")
+                .into_split();
+
             Self {
-                addr,
                 events,
-                client: UdpSocket::bind("127.0.0.1:0").await.expect("binds"),
+                requests,
+                responses: BufReader::new(read),
                 _cmd_tx: cmd_tx,
             }
         }
 
-        async fn request(&self, command: &str) {
-            self.client
-                .send_to(command.as_bytes(), self.addr)
+        async fn request(&mut self, command: &str) {
+            self.requests
+                .write_all(format!("{command}\n").as_bytes())
                 .await
                 .expect("sends");
         }
 
-        async fn receive(&self) -> serde_json::Value {
-            // what a real client needs: enough for a track event carrying a cover
-            let mut buf = vec![0u8; MAX_COVER_BYTES * 2];
+        async fn receive(&mut self) -> serde_json::Value {
+            let mut line = String::new();
 
-            let (len, _) =
-                tokio::time::timeout(Duration::from_secs(2), self.client.recv_from(&mut buf))
+            let read =
+                tokio::time::timeout(Duration::from_secs(2), self.responses.read_line(&mut line))
                     .await
-                    .expect("a datagram arrives in time")
+                    .expect("a line arrives in time")
                     .expect("receives");
 
-            serde_json::from_slice(&buf[..len]).expect("valid json")
+            assert_ne!(read, 0, "the server closed the connection");
+
+            serde_json::from_str(&line).expect("valid json")
         }
 
-        /// Whether nothing arrives in the time a loopback datagram would need many times over.
-        async fn receives_nothing(&self) -> bool {
-            let mut buf = [0u8; MAX_DATAGRAM_SIZE];
+        /// Whether nothing arrives in the time a loopback round trip would need many times over.
+        async fn receives_nothing(&mut self) -> bool {
+            let mut line = String::new();
 
-            tokio::time::timeout(Duration::from_millis(250), self.client.recv_from(&mut buf))
-                .await
-                .is_err()
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                self.responses.read_line(&mut line),
+            )
+            .await
+            .is_err()
         }
     }
 
-    /// No response carries a picture any more — a track event is small, and the cover is asked
-    /// for separately. This is what keeps a datagram from exceeding what the OS will send: a real
-    /// sender's artwork runs to ~180 kB, which base64 turns into 240 kB, well past the 65507-byte
-    /// ceiling.
+    /// No response carries a picture: a track event is small, and the cover is asked for
+    /// separately. A real sender's artwork runs to ~180 kB, which base64 turns into 240 kB, and
+    /// most clients want it at most once per track — nothing that belongs in an event fired at
+    /// every seek.
     #[tokio::test]
     async fn no_response_carries_the_cover() {
-        let server = TestServer::start_with(AllowList::default(), |task| {
+        let mut server = TestServer::start_with(AllowList::default(), |task| {
             task.current_cover = Some(Cover {
                 bytes: vec![0xff; 8 * 1024],
                 mime: "image/jpeg",
@@ -2393,96 +2400,86 @@ mod tests {
         assert!(snapshot["track"].get("cover_data").is_none());
     }
 
-    /// The window that made `count: 0` mean two things: the fetch from Spotify starts when the
-    /// track changes, and a client watching `track_changed` asks inside it. The answer has to say
-    /// so, or the client either shows nothing all track or never believes a `count: 0` at all.
+    /// A track without artwork, and a fetch that fails, are both simply quiet. There is no empty
+    /// `cover` event and nothing for a client to interpret: it drew nothing from `track_changed`
+    /// onwards and stays right.
     #[tokio::test]
-    async fn a_cover_still_being_fetched_is_answered_as_pending() {
-        let server = TestServer::start_with(AllowList::default(), |task| {
-            // what the state looks like between `track_changed` and the cover landing
-            task.cover_pending = true;
-        })
-        .await;
-
-        server.request("cover").await;
-
-        let chunk = server.receive().await;
-        assert_eq!(chunk["event"], "cover_chunk");
-        assert_eq!(chunk["count"], 0);
-        // told `count: 0` here, a client shows no artwork for the whole track
-        assert_eq!(chunk["pending"], true);
-    }
-
-    /// The other half of the same guarantee: with nothing being fetched, `count: 0` is final and
-    /// a client can act on it. A client that keeps asking at every track without artwork is no
-    /// better off than one that was told to give up too early.
-    #[tokio::test]
-    async fn a_track_with_no_cover_is_answered_as_final() {
-        let server = TestServer::start(AllowList::default()).await;
-
-        server.request("cover").await;
-
-        let chunk = server.receive().await;
-        assert_eq!(chunk["event"], "cover_chunk");
-        assert_eq!(chunk["count"], 0);
-        assert_eq!(chunk["pending"], false);
-    }
-
-    /// Whatever the fetch reports — a picture, a failure, a timeout — it comes back through one
-    /// channel, and past it nothing is on its way. `pending` has to stop saying otherwise, or a
-    /// client waits out a cover that is never coming.
-    #[tokio::test]
-    async fn a_cover_fetch_that_fails_stops_being_pending() {
+    async fn a_cover_that_never_arrives_is_silence() {
         let mut cover_tx = None;
 
-        let server = TestServer::start_with(AllowList::default(), |task| {
-            task.cover_pending = true;
+        let mut server = TestServer::start_with(AllowList::default(), |task| {
             cover_tx = Some(task.cover_tx.clone());
         })
         .await;
 
-        let cover_tx = cover_tx.expect("the task handed one over");
-        let fetched = CoverFetched {
-            url: None,
-            cover: None,
-        };
+        // subscribing with nothing playing must not produce a cover event of its own
+        server.request("subscribe").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
 
-        cover_tx.send(fetched).expect("the task is still running");
+        // and neither must a fetch coming back empty, which is what a failure or timeout looks
+        // like from the task's side
+        cover_tx
+            .expect("the task handed one over")
+            .send(CoverFetched {
+                url: COVER_URL.to_string(),
+                cover: None,
+            })
+            .expect("the task is running");
 
-        // the send above only queues it; asking gives the loop a turn to take it first
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        server.request("cover").await;
-
-        let chunk = server.receive().await;
-        assert_eq!(chunk["count"], 0);
-        assert_eq!(chunk["pending"], false);
+        assert!(
+            server.receives_nothing().await,
+            "a cover that isn't there should produce no event at all"
+        );
     }
 
-    /// A chunk carrying picture is its own answer, so it never asks anyone to wait.
+    /// The point of subscribing: everything arrives without being asked for, artwork included.
+    /// A subscriber that had to send `cover` would need request/response state, retries and a way
+    /// to tell an answer from an event — all of which is what a push removes.
     #[tokio::test]
-    async fn a_chunk_carrying_picture_is_never_pending() {
-        let server = TestServer::start_with(AllowList::default(), |task| {
-            task.current_cover = Some(Cover {
-                bytes: vec![0xcd; 100],
-                mime: "image/jpeg",
-            });
+    async fn a_cover_is_pushed_to_subscribers_without_being_asked_for() {
+        let mut cover_tx = None;
+
+        let mut server = TestServer::start_with(AllowList::default(), |task| {
+            cover_tx = Some(task.cover_tx.clone());
         })
         .await;
 
-        server.request("cover").await;
+        server.request("subscribe").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
 
-        let chunk = server.receive().await;
-        assert_eq!(chunk["event"], "cover_chunk");
-        assert_eq!(chunk["count"], 1);
-        assert_eq!(chunk["pending"], false);
+        // what a fetch landing looks like from the task's side
+        cover_tx
+            .expect("the task handed one over")
+            .send(CoverFetched {
+                url: COVER_URL.to_string(),
+                cover: Some(Cover {
+                    bytes: vec![0xab; 100],
+                    mime: "image/jpeg",
+                }),
+            })
+            .expect("the task is running");
+
+        let pushed = server.receive().await;
+        assert_eq!(pushed["event"], "cover");
+        assert_eq!(pushed["mime"], "image/jpeg");
+        assert_eq!(pushed["bytes"], 100);
+        assert_eq!(
+            BASE64
+                .decode(pushed["data"].as_str().expect("base64 text").as_bytes())
+                .expect("valid base64"),
+            vec![0xab; 100],
+            "the push has to carry the picture, not a note that one exists"
+        );
     }
 
-    /// A client that subscribes while something is already playing has to learn there is a picture
-    /// to ask for, the same as one that was there when it arrived.
+    /// A client that subscribes while something is already playing gets its picture too. The push
+    /// went out when the cover arrived, which was before this client existed — and since a
+    /// subscriber never asks for anything, without this it would show no artwork until the next
+    /// track.
     #[tokio::test]
-    async fn a_late_subscriber_is_told_about_the_cover_already_playing() {
+    async fn a_late_subscriber_is_sent_the_cover_already_playing() {
         // The state a client walks in on: something is already playing and its picture is here.
-        let server = TestServer::start_with(AllowList::default(), |task| {
+        let mut server = TestServer::start_with(AllowList::default(), |task| {
             task.current_cover = Some(Cover {
                 bytes: vec![0xab; 100],
                 mime: "image/jpeg",
@@ -2495,20 +2492,44 @@ mod tests {
         let snapshot = server.receive().await;
         assert_eq!(snapshot["event"], "snapshot");
 
-        // `cover_available` is broadcast when a picture *arrives*, so a client that subscribed
-        // afterwards never heard about this one and had no reason to send `cover` — it showed no
-        // artwork until the next track produced a fresh announcement.
-        let available = server.receive().await;
-        assert_eq!(available["event"], "cover_available");
-        assert_eq!(available["mime"], "image/jpeg");
-        assert_eq!(available["bytes"], 100);
+        let cover = server.receive().await;
+        assert_eq!(cover["event"], "cover");
+        assert_eq!(cover["mime"], "image/jpeg");
+        assert_eq!(cover["bytes"], 100);
     }
 
-    /// Renewing a lease is `subscribe` again, every 10s in `api_test.py`. That must not re-announce
-    /// the same picture each time, or a subscriber refetches a cover it already has all day.
+    /// A cover in the cache is a picture arriving as much as a fetched one is. Skipping back to a
+    /// track whose cover is still held used to set it and tell nobody, which under a push model
+    /// leaves the client showing nothing.
     #[tokio::test]
-    async fn renewing_a_lease_does_not_re_announce_the_cover() {
-        let server = TestServer::start_with(AllowList::default(), |task| {
+    async fn a_cached_cover_is_pushed_like_any_other() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+
+        let (id, mut queue) = task
+            .admit("127.0.0.1:1234".parse().expect("parses"))
+            .expect("loopback is allowed");
+        task.subscribe(id);
+        task.covers.insert(
+            COVER_URL.to_string(),
+            Cover {
+                bytes: vec![0xcd; 100],
+                mime: "image/jpeg",
+            },
+        );
+
+        task.load_cover(Some(COVER_URL.to_string()));
+
+        let line = queue.try_recv().expect("a cover was pushed");
+        let pushed: serde_json::Value = serde_json::from_str(line.trim()).expect("valid json");
+        assert_eq!(pushed["event"], "cover");
+        assert_eq!(pushed["bytes"], 100);
+    }
+
+    /// A client that subscribes again on a connection that already is must not be sent the same
+    /// picture a second time — it is the one big thing on this wire.
+    #[tokio::test]
+    async fn subscribing_twice_does_not_resend_the_cover() {
+        let mut server = TestServer::start_with(AllowList::default(), |task| {
             task.current_cover = Some(Cover {
                 bytes: vec![0xab; 100],
                 mime: "image/jpeg",
@@ -2518,28 +2539,24 @@ mod tests {
 
         server.request("subscribe").await;
         assert_eq!(server.receive().await["event"], "snapshot");
-        assert_eq!(server.receive().await["event"], "cover_available");
+        assert_eq!(server.receive().await["event"], "cover");
 
         server.request("subscribe").await;
         assert_eq!(server.receive().await["event"], "snapshot");
 
         assert!(
             server.receives_nothing().await,
-            "a renewal announced the cover a second time"
+            "subscribing again sent the cover a second time"
         );
     }
 
-    /// The cover arrives in as many datagrams as it takes, each small enough to send anywhere,
-    /// each saying which of how many it is.
+    /// There is no way to ask for a cover any more, and the command that did is gone rather than
+    /// left lying around: a subscriber is sent one, and nothing else needs one.
     #[tokio::test]
-    async fn the_cover_command_answers_in_chunks() {
-        // spanning several bursts, so the pacing in `send_cover` is part of what this exercises
-        const CHUNKS: usize = COVER_CHUNK_BURST * 2 + 1;
-        const SIZE: usize = COVER_CHUNK_BYTES * (CHUNKS - 1) + 100;
-
-        let server = TestServer::start_with(AllowList::default(), |task| {
+    async fn there_is_no_cover_command() {
+        let mut server = TestServer::start_with(AllowList::default(), |task| {
             task.current_cover = Some(Cover {
-                bytes: vec![0xab; SIZE],
+                bytes: vec![0xab; 100],
                 mime: "image/jpeg",
             });
         })
@@ -2547,39 +2564,15 @@ mod tests {
 
         server.request("cover").await;
 
-        let mut reassembled = Vec::new();
-        for expected_index in 0..CHUNKS {
-            let chunk = server.receive().await;
-            assert_eq!(chunk["event"], "cover_chunk");
-            assert_eq!(chunk["index"], expected_index);
-            assert_eq!(chunk["count"], CHUNKS);
-            assert_eq!(chunk["mime"], "image/jpeg");
-            reassembled.extend(
-                BASE64
-                    .decode(chunk["data"].as_str().expect("base64 text").as_bytes())
-                    .expect("valid base64"),
-            );
-        }
-
-        assert_eq!(reassembled, vec![0xab; SIZE]);
-    }
-
-    /// A track with no cover is answered, not met with silence — a client waiting for a reply
-    /// would otherwise wait forever.
-    #[tokio::test]
-    async fn asking_for_a_cover_that_is_not_there_is_still_answered() {
-        let server = TestServer::start(AllowList::default()).await;
-
-        server.request("cover").await;
-
-        let answer = server.receive().await;
-        assert_eq!(answer["event"], "cover_chunk");
-        assert_eq!(answer["count"], 0);
+        assert!(
+            server.receives_nothing().await,
+            "`cover` is not a command and must not answer like one"
+        );
     }
 
     #[tokio::test]
     async fn subscribers_are_pushed_to_until_they_unsubscribe() {
-        let server = TestServer::start(AllowList::default()).await;
+        let mut server = TestServer::start(AllowList::default()).await;
 
         server.request("subscribe").await;
         assert_eq!(server.receive().await["event"], "snapshot");
@@ -2960,57 +2953,6 @@ mod tests {
         assert_eq!(&buf[..len], b"pause");
     }
 
-    /// Regression test for a real bug: forwarding used to go out on the API's own socket, so the
-    /// helper's `ok` came back to the port `handle_request` reads and was parsed as a command —
-    /// "received 'ok'" followed by "unknown command 'ok'" in the log, once per keypress. The
-    /// forwarding socket must be a different one.
-    #[cfg(feature = "airplay")]
-    #[tokio::test]
-    async fn a_helpers_reply_does_not_come_back_as_a_command() {
-        let helper = UdpSocket::bind("127.0.0.1:0").await.expect("binds");
-        let helper_addr = helper.local_addr().expect("has an address");
-
-        let (mut task, ..) = idle_task(AllowList::default()).await;
-        task.airplay_helper_port = Some(helper_addr.port());
-        let api_addr = task.socket.local_addr().expect("has an address");
-
-        task.handle_airplay_event(AirplayEvent::SessionStarted {
-            connection: 1,
-            peer: helper_addr.ip(),
-        })
-        .await;
-        task.handle_airplay_event(airplay_playing(1, true)).await;
-
-        task.control("pause", Spirc::pause, "pause").await;
-
-        // The helper answers whoever asked, as any reasonable one does.
-        let mut buf = [0u8; 64];
-        let (_, from) = timeout(Duration::from_secs(1), helper.recv_from(&mut buf))
-            .await
-            .expect("the helper was sent something")
-            .expect("received it");
-        helper.send_to(b"ok", from).await.expect("answers");
-
-        assert_ne!(
-            from, api_addr,
-            "the forward must not come from the port commands are read on"
-        );
-
-        // Nothing may be waiting on the API socket: an answer arriving there would be parsed as a
-        // command by the next `handle_request`.
-        let mut unexpected = [0u8; 64];
-        assert!(
-            timeout(
-                Duration::from_millis(200),
-                task.socket.recv_from(&mut unexpected)
-            )
-            .await
-            .is_err(),
-            "the helper's reply reached the command socket: {:?}",
-            String::from_utf8_lossy(&unexpected)
-        );
-    }
-
     /// DACP is the sender's own protocol and needs nothing installed at the far end, so it stays
     /// the first choice; the helper must not steal commands from a sender that resolved one.
     #[cfg(feature = "airplay-remote-control")]
@@ -3153,34 +3095,89 @@ mod tests {
         assert_eq!(task.airplay_dacp.as_ref().map(|(owner, _)| *owner), Some(3));
     }
 
+    /// The allow list is now checked once, when the connection is accepted, so this is where a
+    /// peer that isn't welcome is turned away — before it can send anything at all.
+    ///
+    /// Driven through `admit` rather than over the socket, because a test client is always on
+    /// loopback and loopback is allowed unconditionally.
     #[tokio::test]
-    async fn the_allow_list_keeps_others_from_subscribing() {
-        // driven directly rather than over the socket, because a test client is always on
-        // loopback and loopback is allowed unconditionally
+    async fn the_allow_list_keeps_others_from_connecting() {
         let (mut task, ..) = idle_task("192.168.2.0/24".parse().expect("parses")).await;
 
-        task.handle_request(b"subscribe", "8.8.8.8:1234".parse().expect("parses"))
-            .await;
         assert!(
-            task.subscribers.is_empty(),
-            "a client outside the allow list should be dropped before its command is read"
+            task.admit("8.8.8.8:1234".parse().expect("parses"))
+                .is_none(),
+            "a client outside the allow list should be refused the connection"
         );
+        assert!(task.connections.is_empty());
 
-        task.handle_request(b"subscribe", "192.168.2.5:1234".parse().expect("parses"))
-            .await;
-        assert_eq!(
-            task.subscribers.len(),
-            1,
+        assert!(
+            task.admit("192.168.2.5:1234".parse().expect("parses"))
+                .is_some(),
             "a listed client should be served"
         );
+        assert_eq!(task.connections.len(), 1);
     }
 
     #[tokio::test]
     async fn a_local_client_is_served_without_being_listed() {
-        let server = TestServer::start("192.168.2.0/24".parse().expect("parses")).await;
+        let mut server = TestServer::start("192.168.2.0/24".parse().expect("parses")).await;
 
         server.request("subscribe").await;
 
         assert_eq!(server.receive().await["event"], "snapshot");
+    }
+
+    /// The connection is the subscription: there is no lease to run out, and nothing to sweep, so
+    /// a client that goes away has to be noticed by the socket closing or it is pushed to forever.
+    #[tokio::test]
+    async fn a_client_that_disconnects_is_forgotten() {
+        let mut server = TestServer::start(AllowList::default()).await;
+
+        server.request("subscribe").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
+
+        drop(server.requests);
+        drop(server.responses);
+
+        // the events keep flowing; the point is that nothing tries to push them to a socket that
+        // is gone, and that the task neither panics nor holds the connection open
+        for volume in [1_234, 4_321] {
+            server
+                .events
+                .send(PlayerEvent::VolumeChanged { volume })
+                .expect("the task is running");
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // it is still serving, which is the only thing observable from out here
+        let mut second = TestServer::start(AllowList::default()).await;
+        second.request("status").await;
+        assert_eq!(second.receive().await["event"], "snapshot");
+    }
+
+    /// A client that stops reading must not hold up the task that also serves the player, so its
+    /// queue fills and the connection goes rather than the loop waiting on it.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_dropped() {
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+
+        let (id, queue) = task
+            .admit("127.0.0.1:1234".parse().expect("parses"))
+            .expect("loopback is allowed");
+        task.subscribe(id);
+
+        // nothing drains it, which is exactly what a client that stopped reading looks like once
+        // its socket buffer is full
+        for _ in 0..CONNECTION_QUEUE + 1 {
+            task.broadcast(encode(&Event::VolumeChanged { volume: 1_234 }));
+        }
+
+        assert!(
+            task.connections.is_empty(),
+            "a client that never drains its queue should have been dropped"
+        );
+        drop(queue);
     }
 }

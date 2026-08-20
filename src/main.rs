@@ -704,7 +704,7 @@ async fn get_setup() -> Setup {
     ).optopt(
         API_BIND_SHORT,
         API_BIND,
-        "Address the UDP control API binds to. Defaults to 0.0.0.0:50505.",
+        "Address the TCP control API binds to. Defaults to 0.0.0.0:50505.",
         "ADDRESS"
     ).optopt(
         API_ALLOW_SHORT,
@@ -2198,7 +2198,7 @@ async fn main() {
                         error!("could not start the AirPlay receiver: {e}");
                         exit(1);
                     });
-            // Lets AirPlay's now-playing/control info flow into the same UDP API Spotify
+            // Lets AirPlay's now-playing/control info flow into the same control API Spotify
             // Connect already reports through.
             api_server.set_airplay_events(airplay_events, airplay_control);
             info!("AirPlay receiver enabled");
