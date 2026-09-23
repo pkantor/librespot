@@ -458,6 +458,7 @@ impl ApiServer {
                 playback: PlaybackState::default(),
                 covers: CoverCache::default(),
                 current_cover: None,
+                current_cover_url: None,
                 cover_tx,
                 cover_rx,
                 #[cfg(feature = "airplay")]
@@ -863,11 +864,12 @@ struct ApiServerTask {
     current_volume: VolumeResponse,
     playback: PlaybackState,
     covers: CoverCache,
-    /// The cover the current track is waiting for, if any. Its `track_changed` goes out once that
-    /// fetch reports back, so that the event carries the picture with it.
-    /// The cover of whatever is playing, once there is one. Never part of a track event or any
-    /// other response — a client asks for it with `cover` and gets it in chunks.
+    /// The cover of whatever is playing, once there is one. It is pushed separately from the
+    /// track event so a track change never waits for network I/O.
     current_cover: Option<Cover>,
+    /// Spotify artwork URL expected for the current track. A fetch may finish after another track
+    /// has taken over; its bytes are still worth caching, but must not be published as current art.
+    current_cover_url: Option<String>,
     cover_tx: mpsc::UnboundedSender<CoverFetched>,
     cover_rx: mpsc::UnboundedReceiver<CoverFetched>,
     /// `None` until `set_airplay_events` hands one over (or forever, if AirPlay isn't running at
@@ -1181,8 +1183,10 @@ impl ApiServerTask {
                 let cover_url = cover_to_ship(&audio_item.covers).map(|cover| cover.url.clone());
 
                 self.current_track = TrackResponse::from(*audio_item);
-                self.load_cover(cover_url);
+                // `track_changed` tells clients to discard the old picture. It must therefore be
+                // queued before a cached cover can be pushed synchronously by `load_cover`.
                 self.announce_track();
+                self.load_cover(cover_url);
             }
             PlayerEvent::Playing { position_ms, .. } => {
                 #[cfg(feature = "airplay")]
@@ -1229,6 +1233,7 @@ impl ApiServerTask {
     fn clear_now_playing(&mut self) {
         self.current_track = TrackResponse::default();
         self.current_cover = None;
+        self.current_cover_url = None;
         self.announce_track();
         self.update_playback(Some(false), 0);
     }
@@ -1331,6 +1336,7 @@ impl ApiServerTask {
                 }
                 debug!("AirPlay now playing (connection {connection}): {title}");
                 self.current_cover = None;
+                self.current_cover_url = None;
                 self.current_track = TrackResponse {
                     song_name: title,
                     song_id: String::new(),
@@ -1468,6 +1474,7 @@ impl ApiServerTask {
     /// negative.
     fn load_cover(&mut self, url: Option<String>) {
         self.current_cover = None;
+        self.current_cover_url = url.clone();
 
         let Some(url) = url else {
             return;
@@ -1494,13 +1501,21 @@ impl ApiServerTask {
     /// to do about it: no event goes out, and the client keeps showing nothing, which is what it
     /// has shown since `track_changed`.
     fn handle_cover(&mut self, fetched: CoverFetched) {
-        // worth keeping even if a newer track overtook this fetch: whatever overtook it was most
-        // likely a skip, and a skip back wants this picture again
-        let Some(cover) = fetched.cover else {
+        // Worth keeping even if a newer track overtook this fetch: whatever overtook it was most
+        // likely a skip, and a skip back wants this picture again. Only the cover belonging to the
+        // current track may be published, though.
+        let CoverFetched { url, cover } = fetched;
+        let Some(cover) = cover else {
             return;
         };
 
-        self.covers.insert(fetched.url, cover.clone());
+        self.covers.insert(url.clone(), cover.clone());
+
+        if self.current_cover_url.as_deref() != Some(url.as_str()) {
+            debug!("cover for {url} arrived after the track changed; cached but not sent");
+            return;
+        }
+
         self.announce_cover(cover);
     }
 
@@ -2276,6 +2291,7 @@ mod tests {
             playback: PlaybackState::default(),
             covers: CoverCache::default(),
             current_cover: None,
+            current_cover_url: None,
             cover_tx,
             cover_rx,
             #[cfg(feature = "airplay")]
@@ -2440,6 +2456,7 @@ mod tests {
         let mut cover_tx = None;
 
         let mut server = TestServer::start_with(AllowList::default(), |task| {
+            task.current_cover_url = Some(COVER_URL.to_string());
             cover_tx = Some(task.cover_tx.clone());
         })
         .await;
@@ -2498,6 +2515,47 @@ mod tests {
         assert_eq!(cover["bytes"], 100);
     }
 
+    /// A cached cover is available synchronously. `track_changed` still has to reach subscribers
+    /// first, because receiving it is what tells a client to discard the artwork for the old track.
+    #[tokio::test]
+    async fn a_cached_cover_follows_the_track_change() {
+        let mut server = TestServer::start_with(AllowList::default(), |task| {
+            task.covers.insert(
+                "https://i.scdn.co/image/big".to_string(),
+                Cover {
+                    bytes: vec![0xef; 100],
+                    mime: "image/jpeg",
+                },
+            );
+        })
+        .await;
+
+        server.request("subscribe").await;
+        assert_eq!(server.receive().await["event"], "snapshot");
+
+        server
+            .events
+            .send(PlayerEvent::TrackChanged {
+                audio_item: Box::new(audio_item(UniqueFields::Track {
+                    artists: ArtistsWithRole(vec![artist("Bob Marley")]),
+                    album: "Kaya".to_string(),
+                    album_artists: Vec::new(),
+                    popularity: 42,
+                    number: 3,
+                    disc_number: 1,
+                })),
+            })
+            .expect("the task is running");
+
+        let track = server.receive().await;
+        assert_eq!(track["event"], "track_changed");
+        assert_eq!(track["track"]["song_name"], "Sun Is Shining");
+
+        let cover = server.receive().await;
+        assert_eq!(cover["event"], "cover");
+        assert_eq!(cover["bytes"], 100);
+    }
+
     /// A cover in the cache is a picture arriving as much as a fetched one is. Skipping back to a
     /// track whose cover is still held used to set it and tell nobody, which under a push model
     /// leaves the client showing nothing.
@@ -2523,6 +2581,57 @@ mod tests {
         let pushed: serde_json::Value = serde_json::from_str(line.trim()).expect("valid json");
         assert_eq!(pushed["event"], "cover");
         assert_eq!(pushed["bytes"], 100);
+    }
+
+    /// A network fetch can finish after the user has skipped again. Its result is useful for the
+    /// cache, but publishing it would put the previous track's artwork on the current track.
+    #[tokio::test]
+    async fn a_late_cover_is_cached_but_not_pushed_for_a_newer_track() {
+        const OLD_URL: &str = "https://i.scdn.co/image/old";
+        const NEW_URL: &str = "https://i.scdn.co/image/new";
+
+        let (mut task, ..) = idle_task(AllowList::default()).await;
+        let (id, mut queue) = task
+            .admit("127.0.0.1:1234".parse().expect("parses"))
+            .expect("loopback is allowed");
+        task.subscribe(id);
+
+        task.load_cover(Some(OLD_URL.to_string()));
+        task.load_cover(Some(NEW_URL.to_string()));
+
+        task.handle_cover(CoverFetched {
+            url: OLD_URL.to_string(),
+            cover: Some(Cover {
+                bytes: vec![0xaa; 80],
+                mime: "image/jpeg",
+            }),
+        });
+
+        assert!(
+            task.covers.get(OLD_URL).is_some(),
+            "late art is still cached"
+        );
+        assert!(
+            task.current_cover.is_none(),
+            "late art must not become current"
+        );
+        assert!(
+            queue.try_recv().is_err(),
+            "late art for the previous track must not be pushed"
+        );
+
+        task.handle_cover(CoverFetched {
+            url: NEW_URL.to_string(),
+            cover: Some(Cover {
+                bytes: vec![0xbb; 90],
+                mime: "image/jpeg",
+            }),
+        });
+
+        let line = queue.try_recv().expect("the current cover was pushed");
+        let pushed: serde_json::Value = serde_json::from_str(line.trim()).expect("valid json");
+        assert_eq!(pushed["event"], "cover");
+        assert_eq!(pushed["bytes"], 90);
     }
 
     /// A client that subscribes again on a connection that already is must not be sent the same
